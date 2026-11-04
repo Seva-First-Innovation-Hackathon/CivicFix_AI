@@ -31,6 +31,21 @@ def seed_demo_data():
     try:
         print("[SEED] Checking existing seed data...")
 
+        # 0. Single Government Admin
+        admin_user = db.query(User).filter(User.role == UserRole.GOVERNMENT_ADMIN.value).first()
+        if not admin_user:
+            admin_user = User(
+                email="admin@civicfix.gov",
+                full_name="Municipal Commissioner",
+                phone_number="+91 98765 43210",
+                hashed_password=get_password_hash("AdminSecure2026!"),
+                role=UserRole.GOVERNMENT_ADMIN.value,
+                is_active=True,
+                is_verified=True
+            )
+            db.add(admin_user)
+            db.flush()
+
         # 1. Departments
         dept_data = [
             ("Roads and Public Works", "ROADS", "Road surface, potholes, bridges, and vehicular corridors"),

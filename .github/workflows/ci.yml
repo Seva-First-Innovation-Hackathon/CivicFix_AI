@@ -34,6 +34,8 @@ jobs:
           AI_PROVIDER: mock
           EMAIL_ENABLED: False
         run: |
+          python bootstrap.py || true
+          python seed.py
           python -m pytest tests/ -v -W ignore
 
   frontend-tests:

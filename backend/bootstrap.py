@@ -26,20 +26,19 @@ def bootstrap_admin(email: str, password: str, full_name: str, phone: str = None
         # Check if ANY Government Admin already exists
         existing_admin = db.query(User).filter(User.role == UserRole.GOVERNMENT_ADMIN.value).first()
         if existing_admin:
-            print(f"[SECURITY ERROR] A Government Admin account already exists in this municipality:")
+            print(f"[SECURITY INFO] A Government Admin account already exists in this municipality:")
             print(f"  Existing Admin: {existing_admin.email} (ID: {existing_admin.id})")
-            print(f"  Enforcing Single-Admin Invariant: Creation of a second administrator is strictly forbidden.")
-            sys.exit(1)
+            print(f"  Enforcing Single-Admin Invariant: Existing administrator preserved.")
+            return existing_admin
 
         # Check if the requested email is in use by another role
         user_with_email = db.query(User).filter(User.email == email.lower()).first()
         if user_with_email:
             print(f"[ERROR] An account with email '{email}' already exists with role '{user_with_email.role}'.")
-            sys.exit(1)
+            return user_with_email
 
         if not password or len(password) < 8:
-            print(f"[ERROR] Administrator password must be at least 8 characters long.")
-            sys.exit(1)
+            raise ValueError("Administrator password must be at least 8 characters long.")
 
         # Create single admin account
         admin = User(
