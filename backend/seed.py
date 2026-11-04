@@ -23,8 +23,17 @@ from app.models.enums import (
     WorkOrderStatus, NotificationType
 )
 from app.core.security import get_password_hash
+from app.core.config import settings
+import os
 
 def seed_demo_data():
+    # In production, demo seeding is disabled by default to protect real data from synthetic pollution
+    if settings.ENVIRONMENT.lower() == "production" and os.getenv("ALLOW_DEMO_SEEDING", "").lower() != "true":
+        print("[SEED] Production environment detected (ENVIRONMENT=production).")
+        print("[SEED] Synthetic demo complaints and citizen accounts will NOT be created automatically.")
+        print("[SEED] Preserving production database integrity. (Set ALLOW_DEMO_SEEDING=true to override).")
+        return
+
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
 

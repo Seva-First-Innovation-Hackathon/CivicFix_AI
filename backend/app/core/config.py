@@ -1,10 +1,69 @@
-from typing import List, Union, Optional
-from pydantic import AnyHttpUrl, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+import json
 import os
 from pathlib import Path
+from typing import List, Union, Optional, Annotated
+from urllib.parse import urlparse
+from pydantic import AnyHttpUrl, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict, NoDecode
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
+
+def clean_and_validate_origin(origin: str) -> str:
+    """
+    Validates and normalizes a CORS origin string.
+    Ensures scheme is http/https, host is present, no trailing slashes or path/query/fragment.
+    Strictly forbids wildcard '*' when credentials are used.
+    """
+    cleaned = origin.strip().rstrip('/')
+    if not cleaned:
+        raise ValueError("CORS origin entry cannot be empty.")
+    if cleaned == '*':
+        raise ValueError("Wildcard origin '*' is not permitted when allow_credentials=True.")
+    parsed = urlparse(cleaned)
+    if parsed.scheme not in ('http', 'https'):
+        raise ValueError(f"Invalid CORS origin scheme: {origin!r}. Must use http or https.")
+    if not parsed.netloc:
+        raise ValueError(f"Invalid CORS origin: {origin!r}. Missing host/domain.")
+    if parsed.path or parsed.query or parsed.fragment:
+        raise ValueError(f"Invalid CORS origin: {origin!r}. Origin must not contain path, query parameters, or fragments.")
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+def parse_cors_origins(v: Union[str, List[str], None]) -> List[str]:
+    """
+    Parses CORS origins from JSON array string, comma-separated string, or list.
+    Safely rejects malformed JSON and invalid origins.
+    """
+    if v is None:
+        return []
+    raw_list: List[str] = []
+    if isinstance(v, str):
+        v_str = v.strip()
+        if not v_str:
+            return []
+        if v_str.startswith('[') or v_str.endswith(']'):
+            try:
+                parsed_json = json.loads(v_str)
+            except Exception as e:
+                raise ValueError(f"Invalid JSON array format in CORS origins: {e}")
+            if not isinstance(parsed_json, list):
+                raise ValueError("CORS origins JSON must be an array of strings.")
+            raw_list = [str(x) for x in parsed_json]
+        else:
+            raw_list = [x for x in v_str.split(',')]
+    elif isinstance(v, list):
+        raw_list = [str(x) for x in v]
+    else:
+        raise ValueError(f"Unsupported CORS origins type: {type(v)}")
+
+    validated: List[str] = []
+    for item in raw_list:
+        stripped = item.strip()
+        if not stripped:
+            continue
+        valid_origin = clean_and_validate_origin(stripped)
+        if valid_origin not in validated:
+            validated.append(valid_origin)
+    return validated
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -28,7 +87,7 @@ class Settings(BaseSettings):
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
     # CORS
-    BACKEND_CORS_ORIGINS: List[str] = [
+    BACKEND_CORS_ORIGINS: Annotated[List[str], NoDecode] = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:3000",
@@ -39,28 +98,14 @@ class Settings(BaseSettings):
 
     @field_validator("BACKEND_CORS_ORIGINS", mode="before")
     @classmethod
-    def assemble_cors_origins(cls, v: Union[str, List[str]]) -> List[str]:
-        origins = []
-        if isinstance(v, str) and not v.startswith("["):
-            origins = [i.strip() for i in v.split(",") if i.strip()]
-        elif isinstance(v, list):
-            origins = [str(i).strip() for i in v if str(i).strip()]
-        
-        # Check FRONTEND_ORIGINS environment variable as an alias
+    def assemble_cors_origins(cls, v: Union[str, List[str], None]) -> List[str]:
+        origins = parse_cors_origins(v)
         fe_env = os.getenv("FRONTEND_ORIGINS", "")
         if fe_env:
-            for item in fe_env.split(","):
-                item_clean = item.strip()
-                if item_clean and item_clean not in origins:
-                    origins.append(item_clean)
-
-        return origins if origins else [
-            "http://localhost:5173",
-            "http://127.0.0.1:5173",
-            "http://localhost:3000",
-            "http://127.0.0.1:3000",
-            "http://localhost:8000",
-        ]
+            for item in parse_cors_origins(fe_env):
+                if item not in origins:
+                    origins.append(item)
+        return origins
 
     # Database
     DATABASE_URL: str = f"sqlite:///{BASE_DIR / 'civicfix.db'}"
@@ -91,15 +136,26 @@ class Settings(BaseSettings):
     RATE_LIMIT_EMAIL_VERIFY: str = "3/minute"
     RATE_LIMIT_STORAGE_URL: str = "memory://"
     BEHIND_TRUSTED_PROXY: bool = False
-    TRUSTED_PROXY_IPS: List[str] = ["127.0.0.1", "::1"]
+    TRUSTED_PROXY_IPS: Annotated[List[str], NoDecode] = ["127.0.0.1", "::1"]
 
     @field_validator("TRUSTED_PROXY_IPS", mode="before")
     @classmethod
-    def assemble_trusted_proxies(cls, v: Union[str, List[str]]) -> List[str]:
-        if isinstance(v, str) and not v.startswith("["):
-            return [i.strip() for i in v.split(",")]
+    def assemble_trusted_proxies(cls, v: Union[str, List[str], None]) -> List[str]:
+        if v is None:
+            return ["127.0.0.1", "::1"]
+        if isinstance(v, str):
+            v_str = v.strip()
+            if not v_str:
+                return ["127.0.0.1", "::1"]
+            if v_str.startswith("["):
+                try:
+                    parsed = json.loads(v_str)
+                    return [str(i).strip() for i in parsed if str(i).strip()]
+                except Exception:
+                    pass
+            return [i.strip() for i in v_str.split(",") if i.strip()]
         elif isinstance(v, list):
-            return v
+            return [str(i).strip() for i in v if str(i).strip()]
         return ["127.0.0.1", "::1"]
 
     # AI Intelligence Layer
