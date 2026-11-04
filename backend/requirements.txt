@@ -1,0 +1,28 @@
+# CivicFix AI — Backend Dependencies
+fastapi==0.143.3
+uvicorn[standard]==0.54.0
+pydantic==2.14.1
+pydantic-settings==2.16.0
+email-validator==2.3.0
+sqlalchemy==2.1.5
+alembic==1.20.0
+psycopg2-binary==2.9.13
+argon2-cffi==25.1.0
+pyjwt==2.15.1
+python-multipart==0.0.32
+python-dotenv==1.2.4
+httpx==0.28.1
+pytest==9.1.1
+pytest-asyncio==1.4.0
+PyYAML==6.0.3
+
+# Phase A: Rate Limiting
+slowapi==0.1.10
+limits==5.8.0
+redis==8.1.0
+
+# Phase C: Gemini AI Integration
+google-genai==1.5.0
+
+# Phase D: SMTP Email Delivery
+aiosmtplib==5.1.3

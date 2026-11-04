@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    container_name: civicfix-postgis
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-civicfix_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-CivicFixPostgres2026!}
+      POSTGRES_DB: ${POSTGRES_DB:-civicfix_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U civicfix_user -d civicfix_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: civicfix-backend
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://civicfix_user:CivicFixPostgres2026!@db:5432/civicfix_db
+      SECRET_KEY: ${SECRET_KEY:-civicfix-production-secret-key-min-32-chars-long-2026}
+      AI_PROVIDER: ${AI_PROVIDER:-mock}
+      INITIAL_ADMIN_EMAIL: ${INITIAL_ADMIN_EMAIL:-admin@civicfix.gov}
+      INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD:-AdminSecure2026!}
+    ports:
+      - "8000:8000"
+    volumes:
+      - uploads_data:/app/uploads
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    container_name: civicfix-frontend
+    restart: always
+    depends_on:
+      - backend
+    ports:
+      - "5173:80"
+
+volumes:
+  pgdata:
+  uploads_data:
+
