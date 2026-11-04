@@ -26,3 +26,6 @@ google-genai==1.5.0
 
 # Phase D: SMTP Email Delivery
 aiosmtplib==5.1.3
+
+# Media & Storage Processing
+Pillow>=10.4.0

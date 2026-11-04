@@ -4,7 +4,10 @@ import mimetypes
 from io import BytesIO
 from pathlib import Path
 from typing import Tuple
-from PIL import Image
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 from fastapi import UploadFile, HTTPException, status
 from app.core.config import settings
 
@@ -63,7 +66,7 @@ class StorageService:
             )
 
         # Decode image and strip EXIF (GPS, device serials, camera tags) for citizen privacy
-        if not is_audio:
+        if not is_audio and Image is not None:
             try:
                 # 1. Signature and structure validation
                 raw_image = Image.open(BytesIO(content))
