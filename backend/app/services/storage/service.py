@@ -66,7 +66,12 @@ class StorageService:
             )
 
         # Decode image and strip EXIF (GPS, device serials, camera tags) for citizen privacy
-        if not is_audio and Image is not None:
+        if not is_audio:
+            if Image is None:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Image processing subsystem (Pillow) is unavailable. Cannot securely validate or sanitize uploaded image."
+                )
             try:
                 # 1. Signature and structure validation
                 raw_image = Image.open(BytesIO(content))

@@ -63,9 +63,13 @@ app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
 
 
 # CORS Middleware
+cors_origins = [o for o in settings.BACKEND_CORS_ORIGINS if o and o != "*"]
+if not cors_origins:
+    cors_origins = ["https://civicfix-ai.vercel.app", "http://localhost:5173"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.BACKEND_CORS_ORIGINS or ["*"],
+    allow_origins=cors_origins,
     allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
@@ -144,10 +148,20 @@ def health_check_db(db: Session = Depends(get_db)):
     """Database connectivity status probe without leaking credentials or internal details."""
     try:
         db.execute(Base.metadata.tables["users"].select().limit(1))
+        postgis_version = None
+        if engine.dialect.name == "postgresql":
+            try:
+                from sqlalchemy import text
+                res = db.execute(text("SELECT PostGIS_Version();")).scalar()
+                postgis_version = str(res)
+            except Exception:
+                postgis_version = "not_installed"
+
         return {
             "status": "healthy",
             "database": "connected",
             "dialect": engine.dialect.name,
+            "postgis": postgis_version,
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
     except Exception:

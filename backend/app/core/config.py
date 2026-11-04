@@ -138,6 +138,13 @@ class Settings(BaseSettings):
             self.GOOGLE_API_KEY = self.GEMINI_API_KEY
         elif self.GOOGLE_API_KEY and not self.GEMINI_API_KEY:
             self.GEMINI_API_KEY = self.GOOGLE_API_KEY
+
+        # Enforce no production SQLite fallback
+        if self.ENVIRONMENT.lower() == "production" and self.DATABASE_URL.startswith("sqlite"):
+            raise ValueError(
+                "Production environment requires a PostgreSQL database connection. "
+                "DATABASE_URL cannot fall back to SQLite in production."
+            )
         return self
 
     # Map & Spatial Geocoding Configuration

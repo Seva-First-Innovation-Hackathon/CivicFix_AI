@@ -35,6 +35,7 @@ jobs:
           AI_PROVIDER: mock
           EMAIL_ENABLED: False
         run: |
+          python migrate.py
           python bootstrap.py || true
           python seed.py
           python -m pytest tests/ -v -W ignore
