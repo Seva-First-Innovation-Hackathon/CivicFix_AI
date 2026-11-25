@@ -63,8 +63,13 @@ async function verifyMapLive() {
     console.log('\n[TEST 1] Logging in as Citizen at /login...');
     await page.goto(`${BASE_URL}/login`, { waitUntil: 'domcontentloaded' });
     await page.waitForSelector('input[type="email"]', { timeout: 8000 });
-    await page.type('input[type="email"]', 'citizen.arjun@example.com');
-    await page.type('input[type="password"]', 'CitizenPass2026!');
+    const citizenEmail = process.env.DEMO_CITIZEN_EMAIL || 'citizen.arjun@example.com';
+    const citizenPassword = process.env.DEMO_CITIZEN_PASSWORD || '';
+    if (!citizenPassword) {
+      throw new Error('Set DEMO_CITIZEN_PASSWORD env var before running verify-map-live.js');
+    }
+    await page.type('input[type="email"]', citizenEmail);
+    await page.type('input[type="password"]', citizenPassword);
     await page.click('button[type="submit"]');
 
     await page.waitForFunction(() => window.location.pathname.includes('/citizen'), { timeout: 10000 });
@@ -132,8 +137,13 @@ async function verifyMapLive() {
     await page.evaluate(() => localStorage.clear());
     await page.goto(`${BASE_URL}/staff/login`, { waitUntil: 'domcontentloaded' });
     await page.waitForSelector('input[type="email"]', { timeout: 8000 });
-    await page.type('input[type="email"]', 'officer.sharma@civicfix.gov');
-    await page.type('input[type="password"]', 'StaffSecure2026!');
+    const staffEmail = process.env.DEMO_STAFF_EMAIL || 'officer.sharma@civicfix.gov';
+    const staffPassword = process.env.DEMO_STAFF_PASSWORD || '';
+    if (!staffPassword) {
+      throw new Error('Set DEMO_STAFF_PASSWORD env var before running verify-map-live.js');
+    }
+    await page.type('input[type="email"]', staffEmail);
+    await page.type('input[type="password"]', staffPassword);
     await page.click('button[type="submit"]');
 
     await page.waitForFunction(() => window.location.pathname.includes('/admin'), { timeout: 10000 });
@@ -151,8 +161,13 @@ async function verifyMapLive() {
     await page.evaluate(() => localStorage.clear());
     await page.goto(`${BASE_URL}/staff/login`, { waitUntil: 'domcontentloaded' });
     await page.waitForSelector('input[type="email"]', { timeout: 8000 });
-    await page.type('input[type="email"]', 'crew.patel@civicfix.gov');
-    await page.type('input[type="password"]', 'CrewSecure2026!');
+    const crewEmail = process.env.DEMO_CREW_EMAIL || 'crew.patel@civicfix.gov';
+    const crewPassword = process.env.DEMO_CREW_PASSWORD || '';
+    if (!crewPassword) {
+      throw new Error('Set DEMO_CREW_PASSWORD env var before running verify-map-live.js');
+    }
+    await page.type('input[type="email"]', crewEmail);
+    await page.type('input[type="password"]', crewPassword);
     await page.click('button[type="submit"]');
 
     await page.waitForFunction(() => window.location.pathname.includes('/admin'), { timeout: 10000 });

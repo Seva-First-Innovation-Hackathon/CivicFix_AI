@@ -8,15 +8,17 @@ This guide provides a comprehensive, reproducible script for evaluating and demo
 
 Start the application using either Docker or local mode (see [docs/deployment.md](file:///c:/Users/kinja/OneDrive/Desktop/Civicfix-AI/docs/deployment.md)).
 
-### Seeded Credentials
+### Local Opt-In Demo Accounts
 
-| Role | Username / Email | Password | Primary Mission |
-| :--- | :--- | :--- | :--- |
-| **Government Admin** | `admin@civicfix.gov` | `CivicFixAdmin2026!` | Super-admin, oversight, departments, users, audit logs |
-| **Municipal Member** | `sharma.officer@civicfix.gov` | `OfficerPass2026!` | Triage review, override AI, dispatch work orders |
-| **Field Crew** | `patel.crew@civicfix.gov` | `CrewPass2026!` | Field mobile interface, status updates, submit repair evidence |
-| **Citizen (Arjun)** | `arjun.citizen@example.com` | `CitizenPass2026!` | Submitting complaints, tracking, Two-Stage Verification |
-| **Citizen (Priya)** | `priya.citizen@example.com` | `CitizenPass2026!` | Proving Anti-IDOR protections and duplicate reporting |
+Configure protected passwords via environment variables (`INITIAL_ADMIN_PASSWORD`, `DEMO_STAFF_PASSWORD`, `DEMO_CREW_PASSWORD`, `DEMO_CITIZEN_PASSWORD`) before running opt-in demo seeding (`ALLOW_DEMO_SEEDING=true python backend/seed.py --demo-seed`). Never commit real passwords to documentation or source code.
+
+| Role | Account Email | Primary Mission |
+| :--- | :--- | :--- |
+| **Government Admin** | `admin@civicfix.gov` | Super-admin, oversight, departments, users, audit logs |
+| **Municipal Member** | `officer.sharma@civicfix.gov` | Triage review, override AI, dispatch work orders |
+| **Field Crew** | `crew.patel@civicfix.gov` | Field mobile interface, status updates, submit repair evidence |
+| **Citizen (Arjun)** | `citizen.arjun@example.com` | Submitting complaints, tracking, Two-Stage Verification |
+| **Citizen (Priya)** | `citizen.priya@example.com` | Proving Anti-IDOR protections and duplicate reporting |
 
 ---
 
@@ -24,17 +26,17 @@ Start the application using either Docker or local mode (see [docs/deployment.md
 
 ### Step 1: System Bootstrapping & Single-Admin Invariant
 1. Open terminal in the project directory.
-2. Run the bootstrap CLI command:
+2. Run migrations and the bootstrap CLI command using a strong admin secret:
    ```bash
-   python backend/bootstrap.py --email admin@civicfix.gov --password "CivicFixAdmin2026!" --name "Chief Municipal Administrator"
+   python backend/migrate.py
+   python backend/bootstrap.py --email admin@civicfix.gov --password "$INITIAL_ADMIN_PASSWORD" --name "Chief Municipal Administrator"
    ```
 3. Run the exact same command a second time:
-   - **Expected Result**: System immediately terminates with security alert:
-     `[SECURITY ERROR] An administrator account already exists. Enforcing Single-Admin Invariant: Creation of a second administrator is strictly forbidden.`
+   - **Expected Result**: System preserves the existing sole administrator and enforces the Single-Admin Invariant.
 
-### Step 2: Seed Core Municipal Infrastructure
-1. Execute `python backend/seed.py`.
-2. Inspect the output confirming the initialization of 6 municipal departments (Roads, Sanitation, Electrical, Water, Footpaths, Parks), staff members, field crews, and active complaints.
+### Step 2: Opt-In Local Seed Infrastructure
+1. Execute `ALLOW_DEMO_SEEDING=true python backend/seed.py --demo-seed` (development only).
+2. Verify departments, sample users, and demo complaints exist without printing plaintext passwords.
 
 ### Step 3: Public Website & Multi-Language Switching
 1. Navigate to `http://localhost:5173/` in your browser.
@@ -51,7 +53,7 @@ Start the application using either Docker or local mode (see [docs/deployment.md
    - Security verification: Inspect backend code or network payload to confirm that passing `role: "GOVERNMENT_ADMIN"` is blocked with `400 Bad Request`.
 
 ### Step 5: Complaint Submission via 4-Step Wizard
-1. Sign in as Citizen Arjun (`arjun.citizen@example.com` / `CitizenPass2026!`).
+1. Sign in as Citizen Arjun (`citizen.arjun@example.com` using your configured `DEMO_CITIZEN_PASSWORD`).
 2. Click **Report Issue** (`/report`).
 3. Follow the 4-step guided wizard:
    - **Step 1 (Category & Details)**: Enter Title: `"Deep pothole damaging car axles near Clock Tower"`, Description: `"A large, hazardous crater has formed in the center lane of the road. Multiple vehicles have suffered tire blowouts."`
@@ -85,14 +87,14 @@ Start the application using either Docker or local mode (see [docs/deployment.md
 3. Automated test `test_idor_protection_citizen_complaint_access` confirms this programmatically.
 
 ### Step 9: Municipal Command Center Overview
-1. Sign in to the Municipal Portal (`/staff/login`) as Government Admin (`admin@civicfix.gov` / `CivicFixAdmin2026!`).
+1. Sign in to the Municipal Portal (`/staff/login`) as Government Admin (`admin@civicfix.gov` using your configured admin password).
 2. View the **Executive Dashboard** (`/admin`):
    - Real-time metrics computed directly from database queries (Total complaints, Active work orders, Resolved, SLA compliance rate).
    - Interactive OpenStreetMap displaying all municipal complaints color-coded by priority (`P1 = Red`, `P2 = Amber`, `P3 = Blue`, `P4 = Green`).
 3. Click on **Live Map** (`/admin/map`) to filter markers by department and category.
 
 ### Step 10: Municipal Officer AI Review & Department Assignment
-1. Sign in as Municipal Officer Sharma (`sharma.officer@civicfix.gov` / `OfficerPass2026!`).
+1. Sign in as Municipal Officer Sharma (`officer.sharma@civicfix.gov` using your configured `DEMO_STAFF_PASSWORD`).
 2. Navigate to **Complaints** (`/admin/complaints`) and open Arjun's pothole complaint.
 3. Review the AI assessment panel:
    - Notice the AI's suggested department (`Roads & Bridges`) and priority (`P1`).
@@ -106,7 +108,7 @@ Start the application using either Docker or local mode (see [docs/deployment.md
 4. Submit: Complaint status transitions to `CREW_ASSIGNED` and a unique work order number is issued (`WO-2026-0002`).
 
 ### Step 12: Field Crew Mobile/Task Interface
-1. Sign in through the staff portal as Field Crew Patel (`patel.crew@civicfix.gov` / `CrewPass2026!`).
+1. Sign in through the staff portal as Field Crew Patel (`crew.patel@civicfix.gov` using your configured `DEMO_CREW_PASSWORD`).
 2. Patel is immediately routed to the **Crew Tasks** mobile-friendly screen (`/admin/crew-tasks`).
 3. Only tasks assigned to Patel's crew are visible (Crew isolation enforced).
 4. Click **Start Work**:

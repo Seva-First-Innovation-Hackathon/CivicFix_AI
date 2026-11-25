@@ -1,0 +1,35 @@
+version: '3.8'
+
+# Optional isolated Docker environment for real PostGIS + Redis integration testing.
+# Usage:
+#   docker compose -f infrastructure/docker-compose.test.yml up -d
+#   POSTGIS_TEST_DATABASE_URL="postgresql+psycopg2://civicfix_test:civicfix_test_pwd@localhost:5433/civicfix_postgis_test" \
+#   REDIS_TEST_URL="redis://localhost:6380/0" \
+#   pytest backend/tests/test_phase2b_postgis.py backend/tests/test_phase2c_queue_sla.py -v
+
+services:
+  postgis-test:
+    image: postgis/postgis:16-3.4
+    container_name: civicfix-postgis-test
+    environment:
+      POSTGRES_USER: ${POSTGRES_TEST_USER:-civicfix_test}
+      POSTGRES_PASSWORD: ${POSTGRES_TEST_PASSWORD:-civicfix_test_pwd}
+      POSTGRES_DB: ${POSTGRES_TEST_DB:-civicfix_postgis_test}
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U civicfix_test -d civicfix_postgis_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis-test:
+    image: redis:7.2-alpine
+    container_name: civicfix-redis-test
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10

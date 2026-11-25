@@ -12,16 +12,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install uv package manager
 RUN pip install --no-cache-dir uv
 
-# Copy dependencies
+# Copy application & dependency manifest
 COPY . /app
 
-# Install Python packages
-RUN uv pip install --system fastapi "uvicorn[standard]" "pydantic>=2.7" pydantic-settings "sqlalchemy>=2.0" alembic pyjwt cryptography argon2-cffi python-multipart httpx pytest pytest-asyncio python-dotenv email-validator
+# Install pinned Python packages (matches requirements.txt including Pillow, slowapi, google-genai, aiosmtplib)
+RUN uv pip install --system -r /app/requirements.txt
 
 # Ensure uploads directory
-RUN mkdir -p /app/uploads/complaints /app/uploads/resolutions
+RUN mkdir -p /app/uploads/complaints /app/uploads/resolutions /app/uploads/evidence
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "python bootstrap.py && python seed.py && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
-
+CMD ["sh", "-c", "python migrate.py && ( [ -n \"$INITIAL_ADMIN_PASSWORD\" ] && python bootstrap.py || true ) && uvicorn app.main:app --host 0.0.0.0 --port 8000"]

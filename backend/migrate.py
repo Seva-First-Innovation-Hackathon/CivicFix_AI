@@ -20,9 +20,38 @@ from alembic import command
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("civicfix.migrations")
 
+
+def _detect_unstamped_baseline_revision(inspector) -> str:
+    """
+    Determines the highest Alembic revision already reflected on an unstamped legacy database
+    so stamping never skips unapplied migrations.
+    """
+    tables = set(inspector.get_table_names())
+    complaint_cols = {c["name"] for c in inspector.get_columns("complaints")} if "complaints" in tables else set()
+    att_cols = (
+        {c["name"] for c in inspector.get_columns("complaint_attachments")}
+        if "complaint_attachments" in tables
+        else set()
+    )
+
+    if "resolution_comparisons" in tables and "ai_feedback_records" in tables:
+        return "d4d7b1f5c436"
+    if "sla_breach_events" in tables and "background_jobs" in tables:
+        return "d3c6a0e4b327"
+    if "location" in complaint_cols:
+        return "d2b5f9d3a218"
+    if "storage_provider" in att_cols:
+        return "d1a4e8c2f109"
+    if "refresh_tokens" in tables and "ai_processing_status" in complaint_cols:
+        return "b4e2d9c1f8a3"
+    if "complaint_comments" in tables:
+        return "adca60ea77e0"
+    return "6b691e58bfaa"
+
+
 def run_migrations():
     logger.info("Initializing Alembic migration check for database dialect: %s", engine.dialect.name)
-    
+
     # Enable PostGIS if PostgreSQL
     if engine.dialect.name == "postgresql":
         try:
@@ -53,18 +82,22 @@ def run_migrations():
             has_version_row = False
 
     if not has_version_row and has_users:
-        logger.info("Existing database detected with tables but no active Alembic revision. Stamping head safely...")
-        command.stamp(alembic_cfg, "head")
-        logger.info("Database stamped to Alembic head.")
-    else:
-        logger.info("Applying pending Alembic migrations to head...")
-        command.upgrade(alembic_cfg, "head")
-        logger.info("Alembic migrations completed successfully.")
+        baseline_rev = _detect_unstamped_baseline_revision(inspector)
+        logger.info(
+            "Existing unstamped database detected. Stamping baseline revision '%s' before upgrading to head...",
+            baseline_rev,
+        )
+        command.stamp(alembic_cfg, baseline_rev)
+
+    logger.info("Applying pending Alembic migrations to head...")
+    command.upgrade(alembic_cfg, "head")
+    logger.info("Alembic migrations completed successfully.")
+
 
 if __name__ == "__main__":
     try:
         run_migrations()
-    except Exception as e:
+    except Exception:
         import traceback
         traceback.print_exc()
         sys.exit(1)

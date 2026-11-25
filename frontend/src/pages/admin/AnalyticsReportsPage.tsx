@@ -4,16 +4,23 @@ import {
   AlertTriangle, ShieldCheck, Activity 
 } from 'lucide-react';
 import { adminService } from '../../services/adminService';
-import { AnalyticsOverview } from '../../types';
+import { AIEvaluationSummary, AnalyticsOverview } from '../../types';
 import { Button } from '../../components/common/Button';
 
 export const AnalyticsReportsPage: React.FC = () => {
   const [data, setData] = useState<AnalyticsOverview | null>(null);
+  const [aiEval, setAiEval] = useState<AIEvaluationSummary | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
 
   useEffect(() => {
-    adminService.getDashboardMetrics()
-      .then(setData)
+    Promise.all([
+      adminService.getDashboardMetrics(),
+      adminService.getAiEvaluation().catch(() => null),
+    ])
+      .then(([dashData, evalData]) => {
+        setData(dashData);
+        setAiEval(evalData);
+      })
       .finally(() => setLoading(false));
   }, []);
 
@@ -121,6 +128,52 @@ export const AnalyticsReportsPage: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {/* Admin-Only AI Oversight & Staff Feedback Evaluation */}
+      {aiEval && (
+        <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-xs space-y-4">
+          <div>
+            <h3 className="text-sm font-bold text-slate-900 uppercase tracking-wider">
+              AI Operations & Staff Feedback Governance
+            </h3>
+            <p className="text-[11px] text-slate-500 mt-0.5">{aiEval.evaluation_note}</p>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
+            <div className="p-3 bg-slate-50 rounded-2xl border border-slate-100">
+              <span className="text-slate-400 font-semibold block">Total Analyzed</span>
+              <span className="text-xl font-extrabold text-slate-900">{aiEval.total_analyzed}</span>
+            </div>
+            <div className="p-3 bg-slate-50 rounded-2xl border border-slate-100">
+              <span className="text-slate-400 font-semibold block">Staff Override Rate</span>
+              <span className="text-xl font-extrabold text-ai-700">
+                {aiEval.staff_override_rate_percent}% ({aiEval.staff_override_count})
+              </span>
+            </div>
+            <div className="p-3 bg-slate-50 rounded-2xl border border-slate-100">
+              <span className="text-slate-400 font-semibold block">Image/Text Mismatches</span>
+              <span className="text-xl font-extrabold text-amber-600">{aiEval.cross_modal_disagreement_count}</span>
+            </div>
+            <div className="p-3 bg-slate-50 rounded-2xl border border-slate-100">
+              <span className="text-slate-400 font-semibold block">Failed Triage Runs</span>
+              <span className="text-xl font-extrabold text-rose-600">{aiEval.failed_analysis_count}</span>
+            </div>
+          </div>
+          {aiEval.recent_feedback.length > 0 && (
+            <div className="space-y-2 pt-2 border-t border-slate-100 text-xs">
+              <div className="font-bold text-slate-700">Recent Staff AI Overrides</div>
+              {aiEval.recent_feedback.slice(0, 5).map((fb) => (
+                <div key={fb.id} className="p-2.5 bg-slate-50 rounded-xl border border-slate-100 flex flex-wrap justify-between gap-2">
+                  <span>
+                    <strong>{fb.reviewer_name}</strong>: {fb.original_category} / {fb.original_priority} →{' '}
+                    {fb.corrected_category} / {fb.corrected_priority} — {fb.reason}
+                  </span>
+                  <span className="text-[10px] text-slate-400">{new Date(fb.created_at).toLocaleString()}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 };

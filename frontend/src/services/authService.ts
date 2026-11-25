@@ -1,4 +1,4 @@
-import { apiRequest } from './api';
+import { apiRequest, clearAuthStorage, REFRESH_TOKEN_KEY } from './api';
 import { AuthResponse, User } from '../types';
 
 export const authService = {
@@ -27,13 +27,14 @@ export const authService = {
   },
 
   async logout(): Promise<void> {
+    const refreshToken = typeof localStorage !== 'undefined' ? localStorage.getItem(REFRESH_TOKEN_KEY) : null;
     try {
-      await apiRequest('/auth/logout', { method: 'POST' });
+      await apiRequest('/auth/logout', {
+        method: 'POST',
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      });
     } finally {
-      localStorage.removeItem('civicfix_token');
-      localStorage.removeItem('civicfix_refresh_token');
-      localStorage.removeItem('civicfix_user');
+      clearAuthStorage();
     }
   },
 };
-

@@ -1,7 +1,8 @@
 import { apiRequest } from './api';
 import { 
   AnalyticsOverview, Complaint, Department, WorkOrder, 
-  PotentialDuplicate, User, NotificationItem 
+  PotentialDuplicate, User, NotificationItem, HotspotResponse,
+  AIEvaluationSummary, ResolutionComparison
 } from '../types';
 
 export const adminService = {
@@ -104,11 +105,46 @@ export const adminService = {
     });
   },
 
-  async reviewAiAssessment(id: string, overrideReason: string, category?: string, priority?: string): Promise<Complaint> {
+  async reviewAiAssessment(
+    id: string,
+    overrideReason: string,
+    category?: string,
+    priority?: string,
+    departmentId?: string,
+    imageAssessmentOverride?: string,
+  ): Promise<Complaint> {
     return apiRequest<Complaint>(`/admin/complaints/${id}/review-ai`, {
       method: 'POST',
-      body: JSON.stringify({ override_reason: overrideReason, category, priority }),
+      body: JSON.stringify({
+        override_reason: overrideReason,
+        category,
+        priority,
+        department_id: departmentId || undefined,
+        image_assessment_override: imageAssessmentOverride || undefined,
+      }),
     });
+  },
+
+  async compareEvidence(id: string, beforeAttachmentId?: string, afterAttachmentId?: string): Promise<ResolutionComparison> {
+    return apiRequest<ResolutionComparison>(`/admin/complaints/${id}/compare-evidence`, {
+      method: 'POST',
+      body: JSON.stringify({
+        before_attachment_id: beforeAttachmentId || undefined,
+        after_attachment_id: afterAttachmentId || undefined,
+      }),
+    });
+  },
+
+  async getAiEvaluation(): Promise<AIEvaluationSummary> {
+    return apiRequest<AIEvaluationSummary>('/admin/ai/evaluation');
+  },
+
+  async getQueueStatus(): Promise<any> {
+    return apiRequest('/admin/queue/status');
+  },
+
+  async runSlaCheck(): Promise<any> {
+    return apiRequest('/admin/sla/check', { method: 'POST' });
   },
 
   async submitResolution(id: string, resolutionNotes: string): Promise<Complaint> {
@@ -118,7 +154,13 @@ export const adminService = {
     });
   },
 
-  async getMapComplaints(params?: { category?: string; status?: string; priority?: string }): Promise<{
+  async getMapComplaints(params?: {
+    category?: string;
+    status?: string;
+    priority?: string;
+    date_from?: string;
+    date_to?: string;
+  }): Promise<{
     complaints: Array<{
       id: string;
       reference_number: string;
@@ -138,9 +180,35 @@ export const adminService = {
     if (params?.category) searchParams.append('category', params.category);
     if (params?.status) searchParams.append('status', params.status);
     if (params?.priority) searchParams.append('priority', params.priority);
+    if (params?.date_from) searchParams.append('date_from', params.date_from);
+    if (params?.date_to) searchParams.append('date_to', params.date_to);
 
     const query = searchParams.toString() ? `?${searchParams.toString()}` : '';
     return apiRequest(`/admin/map/complaints${query}`);
+  },
+
+  async getMapHotspots(params?: {
+    category?: string;
+    status?: string;
+    priority?: string;
+    department_id?: string;
+    date_from?: string;
+    date_to?: string;
+    overdue_only?: boolean;
+    grid_size_meters?: number;
+  }): Promise<HotspotResponse> {
+    const searchParams = new URLSearchParams();
+    if (params?.category) searchParams.append('category', params.category);
+    if (params?.status) searchParams.append('status', params.status);
+    if (params?.priority) searchParams.append('priority', params.priority);
+    if (params?.department_id) searchParams.append('department_id', params.department_id);
+    if (params?.date_from) searchParams.append('date_from', params.date_from);
+    if (params?.date_to) searchParams.append('date_to', params.date_to);
+    if (params?.overdue_only) searchParams.append('overdue_only', 'true');
+    if (params?.grid_size_meters) searchParams.append('grid_size_meters', String(params.grid_size_meters));
+
+    const query = searchParams.toString() ? `?${searchParams.toString()}` : '';
+    return apiRequest<HotspotResponse>(`/admin/analytics/hotspots${query}`);
   },
 
   async getDepartments(): Promise<Department[]> {

@@ -104,5 +104,11 @@ export const complaintsService = {
       }),
     });
   },
+
+  async reanalyzeAi(complaintId: string): Promise<Complaint> {
+    return apiRequest<Complaint>(`/complaints/${complaintId}/reanalyze-ai`, {
+      method: 'POST',
+    });
+  },
 };
 

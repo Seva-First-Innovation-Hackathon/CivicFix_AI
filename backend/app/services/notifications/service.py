@@ -9,11 +9,12 @@ def send_notification(
     title: str,
     message: str,
     notification_type: str = NotificationType.SYSTEM.value,
-    complaint_id: Optional[str] = None
-) -> Notification:
+    complaint_id: Optional[str] = None,
+    commit: bool = True,
+) -> Optional[Notification]:
     """Dispatches in-app notification and respects user notification preferences."""
     pref = db.query(NotificationPreference).filter(NotificationPreference.user_id == user_id).first()
-    
+
     if pref and not pref.in_app_enabled:
         return None
 
@@ -26,7 +27,7 @@ def send_notification(
         is_read=False
     )
     db.add(notification)
-    db.commit()
-    db.refresh(notification)
+    if commit:
+        db.commit()
+        db.refresh(notification)
     return notification
-

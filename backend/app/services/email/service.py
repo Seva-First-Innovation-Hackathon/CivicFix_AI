@@ -277,5 +277,42 @@ class EmailService:
 
         return await self._send_raw_email(to_email, subject, html_body, text_body)
 
+    async def send_sla_breach_alert(
+        self,
+        to_email: str,
+        recipient_name: str,
+        reference_number: str,
+        priority: str,
+        hours_overdue: float,
+        complaint_id: str,
+    ) -> bool:
+        """Notifies responsible municipal staff when a complaint SLA target has elapsed."""
+        action_url = f"{settings.PUBLIC_APP_URL}/admin/complaints/{complaint_id}"
+        subject = f"[CivicFix AI] SLA Breach Alert: #{reference_number} ({priority})"
+
+        content_html = f"""
+        <p>Dear {recipient_name},</p>
+        <p>Complaint <strong>#{reference_number}</strong> has exceeded its target SLA deadline.</p>
+        <div style="background: #fef2f2; border: 1px solid #fecaca; border-radius: 6px; padding: 16px; margin: 20px 0;">
+          <p style="margin: 0 0 8px 0;"><strong>Priority:</strong> {priority}</p>
+          <p style="margin: 0;"><strong>Overdue By:</strong> {hours_overdue:.1f} hours</p>
+        </div>
+        <p>Please review the complaint record and dispatch or update the active operational plan.</p>
+        """
+
+        text_body = (
+            f"Dear {recipient_name},\n\n"
+            f"Complaint #{reference_number} ({priority}) has exceeded its SLA target by {hours_overdue:.1f} hours.\n"
+            f"Review complaint: {action_url}\n"
+        )
+
+        html_body = self._render_base_html(
+            title=f"SLA Breach Alert — #{reference_number}",
+            content_html=content_html,
+            action_url=action_url,
+            action_text="Review Overdue Complaint",
+        )
+        return await self._send_raw_email(to_email, subject, html_body, text_body)
+
 email_service = EmailService()
 

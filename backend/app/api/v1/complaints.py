@@ -1,16 +1,17 @@
-import random
+import uuid
 from datetime import datetime, timezone
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Request, BackgroundTasks
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.api.deps import get_current_user
 from app.models.entities import (
     Complaint, ComplaintAttachment, User, ComplaintStatusHistory,
-    ResolutionVerification, Notification, ComplaintComment
+    ResolutionVerification, ComplaintComment
 )
-from app.models.enums import UserRole, ComplaintStatus, NotificationType, CommentType, AttachmentType
+from app.models.enums import UserRole, ComplaintStatus, NotificationType, CommentType
 from app.schemas.complaint import (
     ComplaintCreateRequest, ComplaintResponse, ComplaintListResponse,
     CitizenConfirmResolutionRequest, StatusHistoryResponse, AttachmentResponse,
@@ -18,21 +19,29 @@ from app.schemas.complaint import (
     ComplaintCommentResponse, ComplaintCommentCreateRequest
 )
 from app.services.storage.service import storage_service
-from app.services.ai.service import ai_service
+from app.services.ai.service import run_ai_triage_background
+from app.services.jobs.queue import create_outbox_job, dispatch_outbox_job, run_outbox_job_background
 from app.services.audit import log_audit
 from app.services.notifications.service import send_notification
 from app.services.email.service import email_service
-from app.services.complaints.lifecycle import execute_transition
+from app.services.complaints.lifecycle import execute_transition, enforce_complaint_staff_access
 from app.core.config import settings
 from app.core.limiter import limiter
 
 router = APIRouter(prefix="/complaints", tags=["Complaints"])
 
-def generate_reference_number(db: Session) -> str:
-    year = datetime.now().year
-    count = db.query(Complaint).count() + 1
-    rand_suffix = random.randint(100, 999)
-    return f"CF-{year}-{count:04d}-{rand_suffix}"
+MAX_REFERENCE_ATTEMPTS = 5
+
+
+def generate_reference_number() -> str:
+    """
+    Generates a collision-resistant human-readable complaint reference number
+    independent of table row counts. Format: CF-YYYY-XXXXXXXX.
+    """
+    year = datetime.now(timezone.utc).year
+    unique_code = uuid.uuid4().hex[:8].upper()
+    return f"CF-{year}-{unique_code}"
+
 
 @router.post("", response_model=ComplaintResponse, status_code=status.HTTP_201_CREATED)
 @limiter.limit(settings.RATE_LIMIT_COMPLAINT_CREATE)
@@ -43,74 +52,107 @@ async def create_complaint(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-
-
     """
     Submit a new civic complaint.
-    Initiates AI assessment pipeline and sets up initial tracking.
+    Commits the complaint immediately with collision-safe reference generation and
+    dispatches AI triage asynchronously in BackgroundTasks without blocking submission.
     """
-    ref_num = generate_reference_number(db)
+    complaint = None
+    ref_num = ""
 
-    complaint = Complaint(
-        reference_number=ref_num,
-        citizen_id=current_user.id,
-        title=data.title,
-        description=data.description,
-        category=data.category.value,
-        subcategory=data.subcategory,
-        latitude=data.latitude,
-        longitude=data.longitude,
-        address=data.address,
-        landmark=data.landmark,
-        status=ComplaintStatus.SUBMITTED.value,
-        priority="P3"
-    )
-    db.add(complaint)
-    db.flush()
+    for attempt in range(MAX_REFERENCE_ATTEMPTS):
+        ref_num = generate_reference_number()
+        candidate = Complaint(
+            reference_number=ref_num,
+            citizen_id=current_user.id,
+            title=data.title,
+            description=data.description,
+            category=data.category.value,
+            subcategory=data.subcategory,
+            latitude=data.latitude,
+            longitude=data.longitude,
+            address=data.address,
+            landmark=data.landmark,
+            status=ComplaintStatus.AI_ANALYSIS_PENDING.value,
+            priority="P3",
+            ai_processing_status="PENDING",
+            ai_processing_attempts=0,
+        )
+        try:
+            db.add(candidate)
+            db.flush()
 
-    # Initial status history entry
-    history = ComplaintStatusHistory(
-        complaint_id=complaint.id,
-        from_status=None,
-        to_status=ComplaintStatus.SUBMITTED.value,
-        changed_by_id=current_user.id,
-        change_reason="Complaint submitted by citizen",
-        notes="Awaiting automated AI assessment and triage"
-    )
-    db.add(history)
-    db.commit()
+            db.add(ComplaintStatusHistory(
+                complaint_id=candidate.id,
+                from_status=None,
+                to_status=ComplaintStatus.SUBMITTED.value,
+                changed_by_id=current_user.id,
+                change_reason="Complaint submitted by citizen",
+                notes="Queued for automated AI assessment and triage",
+            ))
+            db.add(ComplaintStatusHistory(
+                complaint_id=candidate.id,
+                from_status=ComplaintStatus.SUBMITTED.value,
+                to_status=ComplaintStatus.AI_ANALYSIS_PENDING.value,
+                changed_by_id=None,
+                change_reason="Enqueued for asynchronous AI analysis",
+                notes="Background AI triage scheduled",
+            ))
+            log_audit(
+                db=db,
+                action="COMPLAINT_CREATED",
+                entity_type="COMPLAINT",
+                entity_id=candidate.id,
+                user_id=current_user.id,
+                details={"reference_number": ref_num, "category": candidate.category},
+                ip_address=request.client.host if request.client else None,
+                commit=False,
+            )
+            ai_job = create_outbox_job(
+                db=db,
+                job_type="ai_triage",
+                dedup_key=f"ai_triage:{candidate.id}",
+                complaint_id=candidate.id,
+                payload={"complaint_id": candidate.id, "force": False},
+                commit=False,
+            )
+            email_job = create_outbox_job(
+                db=db,
+                job_type="send_email",
+                dedup_key=f"ack_email:{candidate.id}",
+                complaint_id=candidate.id,
+                payload={
+                    "template": "submission_acknowledgment",
+                    "to_email": current_user.email,
+                    "citizen_name": current_user.full_name,
+                    "reference_number": ref_num,
+                    "title": candidate.title,
+                    "category": candidate.category,
+                    "complaint_id": candidate.id,
+                },
+                commit=False,
+            )
+            db.commit()
+            complaint = candidate
+            break
+        except IntegrityError:
+            db.rollback()
+            if attempt == MAX_REFERENCE_ATTEMPTS - 1:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to allocate a unique complaint reference number. Please retry."
+                )
+
     db.refresh(complaint)
 
-    # Trigger AI processing
-    try:
-        await ai_service.process_new_complaint(db, complaint)
-    except Exception as e:
-        # AI failure does not lose the complaint
-        pass
+    # Dispatch through Redis/ARQ durable worker queue when enabled, otherwise inline BackgroundTasks
+    if (settings.QUEUE_BACKEND or "inline").lower() in {"redis", "arq"}:
+        await dispatch_outbox_job(db=db, job=ai_job)
+        await dispatch_outbox_job(db=db, job=email_job)
+    else:
+        background_tasks.add_task(run_ai_triage_background, complaint.id)
+        background_tasks.add_task(run_outbox_job_background, email_job.id)
 
-    # Audit log
-    log_audit(
-        db=db,
-        action="COMPLAINT_CREATED",
-        entity_type="COMPLAINT",
-        entity_id=complaint.id,
-        user_id=current_user.id,
-        details={"reference_number": ref_num, "category": complaint.category},
-        ip_address=request.client.host if request.client else None
-    )
-
-    # Enqueue async email acknowledgment (non-blocking, fails safely)
-    background_tasks.add_task(
-        email_service.send_submission_acknowledgment,
-        to_email=current_user.email,
-        citizen_name=current_user.full_name,
-        reference_number=complaint.reference_number,
-        title=complaint.title,
-        category=complaint.category,
-        complaint_id=complaint.id
-    )
-
-    db.refresh(complaint)
     return complaint
 
 
@@ -127,7 +169,7 @@ def get_my_complaints(
     Strict IDOR boundary: users can never view other citizens' complaints here.
     """
     query = db.query(Complaint).filter(Complaint.citizen_id == current_user.id)
-    
+
     if status_filter:
         query = query.filter(Complaint.status == status_filter)
 
@@ -146,6 +188,7 @@ def get_my_complaints(
         complaints=complaints
     )
 
+
 @router.get("/{complaint_id}", response_model=ComplaintResponse)
 def get_complaint_by_id(
     complaint_id: str,
@@ -154,26 +197,21 @@ def get_complaint_by_id(
 ):
     """
     Fetches complaint details with full verification history.
-    Enforces authorization: citizens can only view their own complaint.
-    Strictly filters out internal staff notes and internal investigation evidence for citizens.
+    Enforces authorization across citizens, crews, and department staff,
+    filtering out internal notes and internal investigation attachments for citizens.
     """
     complaint = db.query(Complaint).filter(Complaint.id == complaint_id).first()
     if not complaint:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Complaint not found")
 
-    # IDOR Check: Citizen role can only access their own complaint
-    if current_user.role == UserRole.CITIZEN.value and complaint.citizen_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access forbidden: You cannot view another citizen's private complaint"
-        )
+    enforce_complaint_staff_access(db, current_user, complaint)
 
-    # Privacy filtering: Citizens must never see internal investigation records
     if current_user.role == UserRole.CITIZEN.value:
         complaint.attachments = [a for a in complaint.attachments if not a.is_internal]
         complaint.comments = [c for c in complaint.comments if not c.is_internal]
 
     return complaint
+
 
 @router.get("/{complaint_id}/timeline", response_model=List[StatusHistoryResponse])
 def get_complaint_timeline(
@@ -186,8 +224,7 @@ def get_complaint_timeline(
     if not complaint:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Complaint not found")
 
-    if current_user.role == UserRole.CITIZEN.value and complaint.citizen_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access forbidden")
+    enforce_complaint_staff_access(db, current_user, complaint)
 
     history = (
         db.query(ComplaintStatusHistory)
@@ -196,6 +233,7 @@ def get_complaint_timeline(
         .all()
     )
     return history
+
 
 @router.post("/{complaint_id}/attachments", response_model=AttachmentResponse)
 async def upload_complaint_attachment(
@@ -206,14 +244,12 @@ async def upload_complaint_attachment(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Uploads photographic evidence for a complaint."""
+    """Uploads photographic evidence for a complaint with strict role/ownership authorization."""
     complaint = db.query(Complaint).filter(Complaint.id == complaint_id).first()
     if not complaint:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Complaint not found")
 
-    # Citizen can only upload to their own complaint; staff/crew can upload resolution evidence
-    if current_user.role == UserRole.CITIZEN.value and complaint.citizen_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    enforce_complaint_staff_access(db, current_user, complaint)
 
     is_internal = False
     if current_user.role == UserRole.CITIZEN.value:
@@ -223,22 +259,25 @@ async def upload_complaint_attachment(
         folder = "resolutions" if "RESOLUTION" in attachment_type or "REPAIR" in attachment_type else "complaints"
         att_type = attachment_type
 
-    file_name, rel_path, file_size, mime_type = await storage_service.save_file(file, folder=folder)
+    saved = await storage_service.save_file_with_metadata(file, folder=folder)
 
     attachment = ComplaintAttachment(
         complaint_id=complaint.id,
-        file_name=file_name,
-        file_path=rel_path,
-        file_size=file_size,
-        mime_type=mime_type,
+        file_name=saved.file_name,
+        file_path=saved.file_path,
+        file_size=saved.file_size,
+        mime_type=saved.mime_type,
         attachment_type=att_type,
         is_internal=is_internal,
         description=description,
-        uploaded_by_id=current_user.id
+        uploaded_by_id=current_user.id,
+        storage_provider=saved.storage_provider,
+        storage_object_key=saved.storage_object_key,
+        sha256_checksum=saved.sha256_checksum,
+        storage_verification_status=saved.storage_verification_status,
     )
     db.add(attachment)
-    db.commit()
-    db.refresh(attachment)
+    db.flush()
 
     log_audit(
         db=db,
@@ -246,10 +285,18 @@ async def upload_complaint_attachment(
         entity_type="COMPLAINT_ATTACHMENT",
         entity_id=attachment.id,
         user_id=current_user.id,
-        details={"file_name": file_name, "type": att_type}
+        details={
+            "file_name": saved.file_name,
+            "type": att_type,
+            "storage_provider": saved.storage_provider,
+        },
+        commit=False,
     )
+    db.commit()
+    db.refresh(attachment)
 
     return attachment
+
 
 @router.post("/{complaint_id}/cancel", response_model=ComplaintResponse)
 def cancel_complaint(
@@ -259,9 +306,7 @@ def cancel_complaint(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Citizen cancels an eligible complaint. Mandatory reason is permanently recorded.
-    """
+    """Citizen cancels an eligible complaint. Mandatory reason is permanently recorded."""
     complaint = db.query(Complaint).filter(Complaint.id == complaint_id).first()
     if not complaint:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Complaint not found")
@@ -278,6 +323,7 @@ def cancel_complaint(
         background_tasks=background_tasks
     )
     return complaint
+
 
 @router.post("/{complaint_id}/clarify", response_model=ComplaintResponse)
 def clarify_complaint(
@@ -304,7 +350,6 @@ def clarify_complaint(
             detail=f"Complaint is in '{complaint.status}' status, not awaiting citizen information"
         )
 
-    # Save clarification comment
     comment = ComplaintComment(
         complaint_id=complaint.id,
         user_id=current_user.id,
@@ -325,6 +370,7 @@ def clarify_complaint(
     )
     return complaint
 
+
 @router.get("/{complaint_id}/comments", response_model=List[ComplaintCommentResponse])
 def get_complaint_comments(
     complaint_id: str,
@@ -336,8 +382,7 @@ def get_complaint_comments(
     if not complaint:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Complaint not found")
 
-    if current_user.role == UserRole.CITIZEN.value and complaint.citizen_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    enforce_complaint_staff_access(db, current_user, complaint)
 
     query = db.query(ComplaintComment).filter(ComplaintComment.complaint_id == complaint_id)
     if current_user.role == UserRole.CITIZEN.value:
@@ -359,6 +404,7 @@ def get_complaint_comments(
         ))
     return results
 
+
 @router.post("/{complaint_id}/comments", response_model=ComplaintCommentResponse)
 def add_complaint_comment(
     complaint_id: str,
@@ -371,12 +417,12 @@ def add_complaint_comment(
     if not complaint:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Complaint not found")
 
+    enforce_complaint_staff_access(db, current_user, complaint)
+
     is_internal = data.is_internal
     comment_type = data.comment_type or "STAFF_PUBLIC_NOTE"
 
     if current_user.role == UserRole.CITIZEN.value:
-        if complaint.citizen_id != current_user.id:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
         is_internal = False
         comment_type = "CITIZEN_CLARIFICATION"
 
@@ -403,6 +449,7 @@ def add_complaint_comment(
         created_at=comment.created_at
     )
 
+
 @router.post("/{complaint_id}/confirm-resolution", response_model=ComplaintResponse)
 def confirm_resolution(
     complaint_id: str,
@@ -419,7 +466,6 @@ def confirm_resolution(
     if not complaint:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Complaint not found")
 
-    # Strict authorization: Only the reporting citizen can confirm
     if complaint.citizen_id != current_user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -432,7 +478,6 @@ def confirm_resolution(
             detail=f"Cannot confirm resolution while complaint is in '{complaint.status}' status"
         )
 
-    # Save Citizen verification
     verification = ResolutionVerification(
         complaint_id=complaint.id,
         citizen_id=current_user.id,
@@ -446,41 +491,50 @@ def confirm_resolution(
     complaint.status = ComplaintStatus.RESOLVED.value
     complaint.is_disputed = False
 
-    history = ComplaintStatusHistory(
+    db.add(ComplaintStatusHistory(
         complaint_id=complaint.id,
         from_status=old_status,
         to_status=ComplaintStatus.RESOLVED.value,
         changed_by_id=current_user.id,
         change_reason="Citizen verified and approved resolution",
         notes=f"Rating: {data.feedback_rating or 5}/5. Feedback: {data.feedback_notes or 'None'}"
-    )
-    db.add(history)
+    ))
 
-    # Audit log
     log_audit(
         db=db,
         action="RESOLUTION_CONFIRMED_BY_CITIZEN",
         entity_type="COMPLAINT",
         entity_id=complaint.id,
         user_id=current_user.id,
-        details={"rating": data.feedback_rating}
+        details={"rating": data.feedback_rating},
+        commit=False,
+    )
+
+    from app.services.jobs.queue import dispatch_or_execute_outbox_job
+
+    email_job = create_outbox_job(
+        db=db,
+        job_type="send_email",
+        dedup_key=f"res_verified_confirm:{complaint.id}",
+        complaint_id=complaint.id,
+        payload={
+            "template": "resolution_verified",
+            "to_email": current_user.email,
+            "recipient_name": current_user.full_name,
+            "reference_number": complaint.reference_number,
+            "is_satisfied": True,
+            "notes": data.feedback_notes,
+            "complaint_id": complaint.id,
+        },
+        commit=False,
     )
 
     db.commit()
     db.refresh(complaint)
-
-    # Enqueue async email confirmation notification
-    background_tasks.add_task(
-        email_service.send_resolution_confirmed_or_reopened,
-        to_email=current_user.email,
-        recipient_name=current_user.full_name,
-        reference_number=complaint.reference_number,
-        is_satisfied=True,
-        notes=data.feedback_notes,
-        complaint_id=complaint.id
-    )
+    background_tasks.add_task(dispatch_or_execute_outbox_job, email_job.id)
 
     return complaint
+
 
 @router.post("/{complaint_id}/reopen", response_model=ComplaintResponse)
 def reopen_complaint(
@@ -490,9 +544,7 @@ def reopen_complaint(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Citizen reports that problem remains unresolved. Reopens complaint with recorded justification.
-    """
+    """Citizen reports that problem remains unresolved. Reopens complaint with recorded justification."""
     complaint = db.query(Complaint).filter(Complaint.id == complaint_id).first()
     if not complaint:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Complaint not found")
@@ -509,37 +561,35 @@ def reopen_complaint(
             detail="A detailed reason is required to contest and reopen this complaint"
         )
 
-    verification = ResolutionVerification(
+    db.add(ResolutionVerification(
         complaint_id=complaint.id,
         citizen_id=current_user.id,
         is_satisfied=False,
         reopen_reason=data.reopen_reason,
         feedback_notes=data.feedback_notes
-    )
-    db.add(verification)
+    ))
 
     old_status = complaint.status
     complaint.status = ComplaintStatus.REOPENED.value
     complaint.is_disputed = True
 
-    history = ComplaintStatusHistory(
+    db.add(ComplaintStatusHistory(
         complaint_id=complaint.id,
         from_status=old_status,
         to_status=ComplaintStatus.REOPENED.value,
         changed_by_id=current_user.id,
         change_reason="Citizen reported issue still exists",
         notes=data.reopen_reason
-    )
-    db.add(history)
+    ))
 
-    # Notification to assigned department / crew
     send_notification(
         db=db,
         user_id=complaint.citizen_id,
         title="Complaint Reopened",
         message=f"Complaint #{complaint.reference_number} has been reopened for further remediation.",
         notification_type=NotificationType.REOPENED.value,
-        complaint_id=complaint.id
+        complaint_id=complaint.id,
+        commit=False,
     )
 
     log_audit(
@@ -548,22 +598,32 @@ def reopen_complaint(
         entity_type="COMPLAINT",
         entity_id=complaint.id,
         user_id=current_user.id,
-        details={"reopen_reason": data.reopen_reason}
+        details={"reopen_reason": data.reopen_reason},
+        commit=False,
+    )
+
+    from app.services.jobs.queue import dispatch_or_execute_outbox_job
+
+    email_job = create_outbox_job(
+        db=db,
+        job_type="send_email",
+        dedup_key=f"res_verified_reopen:{complaint.id}",
+        complaint_id=complaint.id,
+        payload={
+            "template": "resolution_verified",
+            "to_email": current_user.email,
+            "recipient_name": current_user.full_name,
+            "reference_number": complaint.reference_number,
+            "is_satisfied": False,
+            "notes": data.reopen_reason,
+            "complaint_id": complaint.id,
+        },
+        commit=False,
     )
 
     db.commit()
     db.refresh(complaint)
-
-    # Enqueue async email contest notification
-    background_tasks.add_task(
-        email_service.send_resolution_confirmed_or_reopened,
-        to_email=current_user.email,
-        recipient_name=current_user.full_name,
-        reference_number=complaint.reference_number,
-        is_satisfied=False,
-        notes=data.reopen_reason,
-        complaint_id=complaint.id
-    )
+    background_tasks.add_task(dispatch_or_execute_outbox_job, email_job.id)
 
     return complaint
 
@@ -573,23 +633,41 @@ def reopen_complaint(
 async def reanalyze_complaint_ai(
     complaint_id: str,
     request: Request,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
-    Triggers AI re-analysis on an existing complaint.
-    Strictly rate-limited to prevent abuse or API quota exhaustion.
+    Safely triggers or retries asynchronous AI triage on an existing complaint.
+    Rejects duplicate concurrent processing cleanly (HTTP 409) when already in flight.
     """
     complaint = db.query(Complaint).filter(Complaint.id == complaint_id).first()
     if not complaint:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Complaint not found")
 
-    # Anti-IDOR check: citizen can only request re-analysis for their own complaint
-    if current_user.role == UserRole.CITIZEN.value and complaint.citizen_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    enforce_complaint_staff_access(db, current_user, complaint)
 
-    await ai_service.process_new_complaint(db=db, complaint=complaint)
+    if complaint.ai_processing_status == "PROCESSING":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="AI analysis is already in progress for this complaint."
+        )
+
+    complaint.ai_processing_status = "PENDING"
+    complaint.ai_processing_error = None
+    ai_job = create_outbox_job(
+        db=db,
+        job_type="ai_triage",
+        dedup_key=f"ai_triage_reanalyze:{complaint.id}",
+        complaint_id=complaint.id,
+        payload={"complaint_id": complaint.id, "force": True},
+        commit=False,
+    )
+    db.commit()
     db.refresh(complaint)
+
+    if (settings.QUEUE_BACKEND or "inline").lower() in {"redis", "arq"}:
+        await dispatch_outbox_job(db=db, job=ai_job)
+    else:
+        background_tasks.add_task(run_ai_triage_background, complaint.id, True)
     return complaint
-
-

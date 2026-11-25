@@ -2,9 +2,8 @@ import logging
 from typing import Optional, Dict, List
 from fastapi import HTTPException, status, BackgroundTasks
 from sqlalchemy.orm import Session
-from datetime import datetime, timezone
 
-from app.models.entities import Complaint, ComplaintStatusHistory, User, Notification
+from app.models.entities import Complaint, ComplaintStatusHistory, User, WorkOrder
 from app.models.enums import UserRole, ComplaintStatus, NotificationType
 from app.services.audit import log_audit
 from app.services.notifications.service import send_notification
@@ -25,6 +24,10 @@ VALID_TRANSITIONS: Dict[str, List[str]] = {
     ComplaintStatus.AI_ANALYSIS_PENDING.value: [
         ComplaintStatus.UNDER_REVIEW.value,
         ComplaintStatus.VERIFIED.value,
+        ComplaintStatus.ASSIGNED.value,
+        ComplaintStatus.AWAITING_CITIZEN_INFORMATION.value,
+        ComplaintStatus.FLAGGED_FOR_INVESTIGATION.value,
+        ComplaintStatus.REJECTED.value,
         ComplaintStatus.CANCELLED.value,
     ],
     ComplaintStatus.UNDER_REVIEW.value: [
@@ -90,6 +93,51 @@ VALID_TRANSITIONS: Dict[str, List[str]] = {
     ],
 }
 
+
+def enforce_complaint_department_scope(user: User, complaint: Complaint) -> None:
+    """
+    Enforces strict departmental boundary for Municipal Members.
+    If the complaint belongs to a department, a Municipal Member without a matching
+    department membership (including having no membership at all) is denied.
+    """
+    if user.role != UserRole.MUNICIPAL_MEMBER.value:
+        return
+    if complaint.department_id:
+        if not user.department_membership or user.department_membership.department_id != complaint.department_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: You do not have jurisdiction over complaints belonging to another department"
+            )
+
+
+def enforce_complaint_staff_access(db: Session, user: User, complaint: Complaint) -> None:
+    """Enforces role-appropriate authorization for accessing or acting on a complaint."""
+    if user.role == UserRole.GOVERNMENT_ADMIN.value:
+        return
+    if user.role == UserRole.CITIZEN.value:
+        if complaint.citizen_id != user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access forbidden: You cannot access another citizen's private complaint"
+            )
+        return
+    if user.role == UserRole.FIELD_CREW.value:
+        has_wo = db.query(WorkOrder).filter(
+            WorkOrder.complaint_id == complaint.id,
+            WorkOrder.crew_id == user.id
+        ).first()
+        if complaint.assigned_crew_id != user.id and not has_wo:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: Complaint is not assigned to your crew"
+            )
+        return
+    if user.role == UserRole.MUNICIPAL_MEMBER.value:
+        enforce_complaint_department_scope(user, complaint)
+        return
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+
 def validate_transition(
     complaint: Complaint,
     target_status: str,
@@ -124,9 +172,10 @@ def validate_transition(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access denied: You do not own this complaint"
             )
-        
+
         citizen_allowed = {
             (ComplaintStatus.SUBMITTED.value, ComplaintStatus.CANCELLED.value),
+            (ComplaintStatus.AI_ANALYSIS_PENDING.value, ComplaintStatus.CANCELLED.value),
             (ComplaintStatus.UNDER_REVIEW.value, ComplaintStatus.CANCELLED.value),
             (ComplaintStatus.VERIFIED.value, ComplaintStatus.CANCELLED.value),
             (ComplaintStatus.AWAITING_CITIZEN_INFORMATION.value, ComplaintStatus.CANCELLED.value),
@@ -142,18 +191,17 @@ def validate_transition(
             )
 
     elif user.role == UserRole.FIELD_CREW.value:
-        # Field crew can only update their assigned complaints
         if complaint.assigned_crew_id != user.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Access denied: This complaint is not assigned to your crew"
             )
-        
+
         crew_allowed = {
             (ComplaintStatus.ASSIGNED.value, ComplaintStatus.IN_PROGRESS.value),
             (ComplaintStatus.IN_PROGRESS.value, ComplaintStatus.WORK_COMPLETED_PENDING_REVIEW.value),
             (ComplaintStatus.IN_PROGRESS.value, ComplaintStatus.ASSIGNED.value),
-            (ComplaintStatus.IN_PROGRESS.value, ComplaintStatus.AWAITING_CITIZEN_CONFIRMATION.value), # legacy support
+            (ComplaintStatus.IN_PROGRESS.value, ComplaintStatus.AWAITING_CITIZEN_CONFIRMATION.value),  # legacy support
         }
         if (current_status, target_status) not in crew_allowed:
             raise HTTPException(
@@ -162,13 +210,7 @@ def validate_transition(
             )
 
     elif user.role == UserRole.MUNICIPAL_MEMBER.value:
-        # Department scoping: if complaint has a department assigned, member must belong to it
-        if complaint.department_id and user.department_membership:
-            if user.department_membership.department_id != complaint.department_id:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Access denied: You do not have jurisdiction over complaints belonging to another department"
-                )
+        enforce_complaint_department_scope(user, complaint)
 
         # Municipal member cannot directly mark RESOLVED without citizen verification
         if target_status == ComplaintStatus.RESOLVED.value:
@@ -178,12 +220,18 @@ def validate_transition(
             )
 
     # Mandatory reason checks
-    if target_status in [ComplaintStatus.REJECTED.value, ComplaintStatus.CANCELLED.value, ComplaintStatus.FLAGGED_FOR_INVESTIGATION.value, ComplaintStatus.REOPENED.value]:
+    if target_status in [
+        ComplaintStatus.REJECTED.value,
+        ComplaintStatus.CANCELLED.value,
+        ComplaintStatus.FLAGGED_FOR_INVESTIGATION.value,
+        ComplaintStatus.REOPENED.value,
+    ]:
         if not reason or len(reason.strip()) < 5:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"A documented reason of at least 5 characters is required for status '{target_status}'"
             )
+
 
 def execute_transition(
     db: Session,
@@ -196,7 +244,7 @@ def execute_transition(
 ) -> Complaint:
     """
     Executes a validated transition, creates immutable audit & history records,
-    and enqueues in-app and email notifications.
+    and enqueues in-app and email notifications within one atomic transaction.
     """
     validate_transition(complaint, target_status, user, reason)
 
@@ -212,7 +260,6 @@ def execute_transition(
     elif target_status == ComplaintStatus.AWAITING_CITIZEN_INFORMATION.value:
         complaint.clarification_requested = reason
 
-    # Immutable history entry
     history = ComplaintStatusHistory(
         complaint_id=complaint.id,
         from_status=old_status,
@@ -223,7 +270,6 @@ def execute_transition(
     )
     db.add(history)
 
-    # Audit log
     log_audit(
         db=db,
         action="COMPLAINT_STATUS_TRANSITION",
@@ -235,10 +281,10 @@ def execute_transition(
             "to_status": target_status,
             "reason": reason,
             "notes": notes
-        }
+        },
+        commit=False,
     )
 
-    # Notification mappings
     public_status_titles = {
         ComplaintStatus.VERIFIED.value: "Complaint Verified & Prioritized",
         ComplaintStatus.AWAITING_CITIZEN_INFORMATION.value: "Action Required: More Information Requested",
@@ -252,6 +298,7 @@ def execute_transition(
         ComplaintStatus.CANCELLED.value: "Complaint Cancelled",
     }
 
+    email_job = None
     if target_status in public_status_titles and complaint.citizen_id:
         title = public_status_titles[target_status]
         msg = f"Your complaint #{complaint.reference_number} is now in '{target_status}' status."
@@ -264,23 +311,35 @@ def execute_transition(
             title=title,
             message=msg,
             notification_type=NotificationType.PROGRESS_UPDATE.value,
-            complaint_id=complaint.id
+            complaint_id=complaint.id,
+            commit=False,
         )
 
-        # Enqueue async email if citizen has email
         if background_tasks and complaint.citizen and complaint.citizen.email:
-            background_tasks.add_task(
-                email_service.send_status_update,
-                to_email=complaint.citizen.email,
-                recipient_name=complaint.citizen.full_name or "Citizen",
-                reference_number=complaint.reference_number,
-                old_status=old_status,
-                new_status=target_status,
-                reason=reason,
-                complaint_id=complaint.id
+            from app.services.jobs.queue import create_outbox_job
+
+            email_job = create_outbox_job(
+                db=db,
+                job_type="send_email",
+                dedup_key=f"status_email:{complaint.id}:{target_status}:{history.id}",
+                complaint_id=complaint.id,
+                payload={
+                    "template": "status_update",
+                    "to_email": complaint.citizen.email,
+                    "recipient_name": complaint.citizen.full_name or "Citizen",
+                    "reference_number": complaint.reference_number,
+                    "old_status": old_status,
+                    "new_status": target_status,
+                    "reason": reason,
+                    "complaint_id": complaint.id,
+                },
+                commit=False,
             )
 
     db.commit()
     db.refresh(complaint)
-    return complaint
+    if email_job is not None and background_tasks is not None:
+        from app.services.jobs.queue import dispatch_or_execute_outbox_job
 
+        background_tasks.add_task(dispatch_or_execute_outbox_job, email_job.id)
+    return complaint

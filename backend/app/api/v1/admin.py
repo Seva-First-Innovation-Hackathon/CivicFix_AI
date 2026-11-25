@@ -4,7 +4,7 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Response, Request, BackgroundTasks
 from sqlalchemy.orm import Session
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, and_, case
 
 from app.db.session import get_db
 from app.api.deps import (
@@ -15,7 +15,8 @@ from app.models.entities import (
     User, MunicipalDepartment, DepartmentMembership, CrewProfile,
     Complaint, ComplaintAttachment, AIAnalysis, ComplaintStatusHistory,
     WorkOrder, WorkOrderUpdate, ResolutionSubmission, PotentialDuplicate,
-    AuditLog, SystemSetting, Notification, ComplaintComment, ResolutionVerification
+    AuditLog, SystemSetting, Notification, ComplaintComment, ResolutionVerification, RefreshToken,
+    SLABreachEvent, BackgroundJob, AIFeedback, ResolutionComparison
 )
 from app.models.enums import (
     UserRole, ComplaintStatus, PriorityLevel, WorkOrderStatus,
@@ -27,7 +28,7 @@ from app.schemas.complaint import (
     ComplaintAssignmentRequest, AIOverrideRequest, ResolutionSubmitRequest,
     ComplaintVerifyRequest, ComplaintRejectRequest, ComplaintFlagInvestigationRequest,
     ReviewEvidenceRequest, ComplaintCommentCreateRequest, ComplaintCommentResponse,
-    ComplaintClarificationRequest
+    ComplaintClarificationRequest, CompareEvidenceRequest, ResolutionComparisonResponse
 )
 from app.schemas.department import DepartmentCreate, DepartmentUpdate, DepartmentResponse
 from app.schemas.work_order import (
@@ -41,7 +42,7 @@ from app.core.security import get_password_hash
 from app.services.audit import log_audit
 from app.services.notifications.service import send_notification
 from app.services.email.service import email_service
-from app.services.complaints.lifecycle import execute_transition
+from app.services.complaints.lifecycle import execute_transition, enforce_complaint_department_scope, enforce_complaint_staff_access
 
 router = APIRouter(prefix="/admin", tags=["Municipal Administration"])
 
@@ -92,6 +93,13 @@ def get_dashboard_metrics(
     else:
         satisfaction_rate = 100.0
 
+    sla_breach_events_count = db.query(SLABreachEvent).count()
+    queue_backlog_count = (
+        db.query(BackgroundJob)
+        .filter(BackgroundJob.status.in_(["PENDING_DISPATCH", "QUEUED", "RETRY_SCHEDULED"]))
+        .count()
+    )
+
     metrics = KeyMetrics(
         total_complaints=total,
         active_complaints=active,
@@ -102,6 +110,8 @@ def get_dashboard_metrics(
         reopened_complaints=reopened,
         high_priority_unresolved=high_prio,
         overdue_complaints=overdue,
+        sla_breach_events_count=sla_breach_events_count,
+        queue_backlog_count=queue_backlog_count,
         average_resolution_hours=avg_res_hours,
         citizen_satisfaction_rate=satisfaction_rate
     )
@@ -128,17 +138,52 @@ def get_dashboard_metrics(
         for prio, cnt in prio_counts
     ]
 
-    # By Department
-    depts = db.query(MunicipalDepartment).all()
-    by_department = []
-    for d in depts:
-        d_total = db.query(Complaint).filter(Complaint.department_id == d.id).count()
-        d_res = db.query(Complaint).filter(Complaint.department_id == d.id, Complaint.status == "RESOLVED").count()
-        by_department.append(DepartmentCount(
-            department_name=d.name,
-            count=d_total,
-            resolved_count=d_res
-        ))
+    # By Department (single grouped query, no N+1 loops; honors department membership scope)
+    dept_query = (
+        db.query(
+            MunicipalDepartment.id.label("department_id"),
+            MunicipalDepartment.name.label("department_name"),
+            func.count(Complaint.id).label("total_count"),
+            func.sum(
+                case(
+                    (and_(Complaint.id.isnot(None), Complaint.status == ComplaintStatus.RESOLVED.value), 1),
+                    else_=0,
+                )
+            ).label("resolved_count"),
+            func.sum(
+                case(
+                    (
+                        and_(
+                            Complaint.id.isnot(None),
+                            Complaint.status.notin_([ComplaintStatus.RESOLVED.value, ComplaintStatus.CANCELLED.value]),
+                        ),
+                        1,
+                    ),
+                    else_=0,
+                )
+            ).label("open_count"),
+        )
+        .outerjoin(Complaint, Complaint.department_id == MunicipalDepartment.id)
+    )
+    if current_user.role == UserRole.MUNICIPAL_MEMBER.value:
+        if current_user.department_membership:
+            dept_query = dept_query.filter(
+                MunicipalDepartment.id == current_user.department_membership.department_id
+            )
+        else:
+            dept_query = dept_query.filter(False)
+
+    dept_rows = dept_query.group_by(MunicipalDepartment.id, MunicipalDepartment.name).all()
+    by_department = [
+        DepartmentCount(
+            department_id=row.department_id,
+            department_name=row.department_name,
+            count=int(row.total_count or 0),
+            resolved_count=int(row.resolved_count or 0),
+            open_count=int(row.open_count or 0),
+        )
+        for row in dept_rows
+    ]
 
     # Trends (past 7 days)
     trends = []
@@ -169,6 +214,7 @@ def list_all_complaints(
     status: Optional[str] = None,
     priority: Optional[str] = None,
     department_id: Optional[str] = None,
+    overdue_only: bool = False,
     search: Optional[str] = None,
     current_user: User = Depends(require_any_staff),
     db: Session = Depends(get_db)
@@ -205,6 +251,12 @@ def list_all_complaints(
         query = query.filter(Complaint.status == status)
     if priority:
         query = query.filter(Complaint.priority == priority)
+    if overdue_only:
+        query = query.filter(
+            Complaint.sla_deadline.isnot(None),
+            Complaint.sla_deadline < datetime.now(timezone.utc),
+            Complaint.status.notin_([ComplaintStatus.RESOLVED.value, ComplaintStatus.CANCELLED.value, ComplaintStatus.REJECTED.value]),
+        )
     if search:
         search_filter = f"%{search}%"
         query = query.filter(
@@ -243,21 +295,7 @@ def get_complaint_admin(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Complaint not found")
 
     # Scope checks
-    if current_user.role == UserRole.FIELD_CREW.value:
-        has_wo = db.query(WorkOrder).filter(WorkOrder.complaint_id == complaint.id, WorkOrder.crew_id == current_user.id).first()
-        if complaint.assigned_crew_id != current_user.id and not has_wo:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Access denied: Complaint is not assigned to your crew"
-            )
-
-    elif current_user.role == UserRole.MUNICIPAL_MEMBER.value:
-        if complaint.department_id and current_user.department_membership:
-            if current_user.department_membership.department_id != complaint.department_id:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Access denied: Complaint belongs to a different department"
-                )
+    enforce_complaint_staff_access(db, current_user, complaint)
 
     return complaint
 
@@ -452,6 +490,8 @@ def add_internal_staff_note(
     if not complaint:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Complaint not found")
 
+    enforce_complaint_department_scope(current_user, complaint)
+
     comment = ComplaintComment(
         complaint_id=complaint.id,
         user_id=current_user.id,
@@ -487,6 +527,8 @@ def assign_complaint(
     if not complaint:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Complaint not found")
 
+    enforce_complaint_department_scope(current_user, complaint)
+
     dept = db.query(MunicipalDepartment).filter(MunicipalDepartment.id == data.department_id).first()
     if not dept:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department not found")
@@ -513,7 +555,8 @@ def assign_complaint(
         title="Assigned to Department",
         message=f"Your complaint #{complaint.reference_number} has been routed to {dept.name}.",
         notification_type=NotificationType.DEPARTMENT_ASSIGNED.value,
-        complaint_id=complaint.id
+        complaint_id=complaint.id,
+        commit=False,
     )
 
     log_audit(
@@ -522,7 +565,8 @@ def assign_complaint(
         entity_type="COMPLAINT",
         entity_id=complaint.id,
         user_id=current_user.id,
-        details={"department_id": dept.id, "priority": complaint.priority}
+        details={"department_id": dept.id, "priority": complaint.priority},
+        commit=False,
     )
 
     db.commit()
@@ -537,17 +581,29 @@ def override_ai_assessment(
     db: Session = Depends(get_db)
 ):
     """
-    Municipal staff reviews and overrides AI triage recommendation.
-    Enforces recorded justification for accountability.
+    Municipal staff reviews and overrides AI triage recommendation across category, priority,
+    department routing, and/or image assessment while persisting structured feedback records.
     """
     complaint = db.query(Complaint).filter(Complaint.id == complaint_id).first()
     if not complaint:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Complaint not found")
 
+    enforce_complaint_department_scope(current_user, complaint)
+
     if not complaint.ai_analysis:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No AI assessment exists for this complaint")
 
+    if data.department_id:
+        target_dept = db.query(MunicipalDepartment).filter(MunicipalDepartment.id == data.department_id).first()
+        if not target_dept:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Specified department not found")
+
     ai_record = complaint.ai_analysis
+    orig_category = ai_record.suggested_category
+    orig_priority = ai_record.suggested_priority
+    orig_dept_id = ai_record.suggested_department_id or complaint.department_id
+    orig_img_assessment = ai_record.image_suggested_category or ai_record.visual_findings
+
     ai_record.is_overridden = True
     ai_record.overridden_by_id = current_user.id
     ai_record.override_reason = data.override_reason
@@ -557,6 +613,24 @@ def override_ai_assessment(
         complaint.category = data.category.value
     if data.priority:
         complaint.priority = data.priority.value
+    if data.department_id:
+        complaint.department_id = data.department_id
+
+    feedback = AIFeedback(
+        complaint_id=complaint.id,
+        ai_analysis_id=ai_record.id,
+        reviewer_id=current_user.id,
+        original_category=orig_category,
+        corrected_category=data.category.value if data.category else complaint.category,
+        original_priority=orig_priority,
+        corrected_priority=data.priority.value if data.priority else complaint.priority,
+        original_department_id=orig_dept_id,
+        corrected_department_id=data.department_id or complaint.department_id,
+        original_image_assessment=orig_img_assessment,
+        corrected_image_assessment=data.image_assessment_override,
+        reason=data.override_reason,
+    )
+    db.add(feedback)
 
     log_audit(
         db=db,
@@ -567,13 +641,110 @@ def override_ai_assessment(
         details={
             "new_category": data.category.value if data.category else None,
             "new_priority": data.priority.value if data.priority else None,
-            "reason": data.override_reason
-        }
+            "new_department_id": data.department_id,
+            "image_assessment_override": data.image_assessment_override,
+            "reason": data.override_reason,
+        },
+        commit=False,
     )
 
     db.commit()
     db.refresh(complaint)
     return complaint
+
+
+@router.post("/complaints/{complaint_id}/compare-evidence", response_model=ResolutionComparisonResponse)
+async def compare_complaint_resolution_evidence(
+    complaint_id: str,
+    data: Optional[CompareEvidenceRequest] = None,
+    current_user: User = Depends(require_any_staff),
+    db: Session = Depends(get_db),
+):
+    """
+    Runs AI-assisted advisory comparison between before-repair citizen photos and
+    after-repair resolution photos. Human review remains mandatory.
+    """
+    complaint = db.query(Complaint).filter(Complaint.id == complaint_id).first()
+    if not complaint:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Complaint not found")
+
+    enforce_complaint_staff_access(db, current_user, complaint)
+
+    from app.services.ai.comparison import compare_complaint_evidence
+
+    return await compare_complaint_evidence(
+        db=db,
+        complaint=complaint,
+        requested_by=current_user,
+        before_attachment_id=data.before_attachment_id if data else None,
+        after_attachment_id=data.after_attachment_id if data else None,
+    )
+
+
+@router.get("/ai/evaluation")
+def get_ai_evaluation_summary(
+    current_user: User = Depends(require_government_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Government Admin AI operational oversight view: provider usage, override rate,
+    cross-modal category mismatches, confidence routing breakdown, and failure counts.
+    """
+    total_analyzed = db.query(AIAnalysis).count()
+    override_count = db.query(AIAnalysis).filter(AIAnalysis.is_overridden == True).count()
+    mismatch_count = db.query(AIAnalysis).filter(AIAnalysis.cross_modal_mismatch == True).count()
+    override_rate = round((override_count / total_analyzed) * 100.0, 2) if total_analyzed > 0 else 0.0
+
+    provider_rows = db.query(AIAnalysis.provider, func.count(AIAnalysis.id)).group_by(AIAnalysis.provider).all()
+    provider_distribution = {str(p): int(cnt) for p, cnt in provider_rows}
+
+    tier_rows = db.query(AIAnalysis.routing_tier, func.count(AIAnalysis.id)).group_by(AIAnalysis.routing_tier).all()
+    confidence_tiers = {str(t): int(cnt) for t, cnt in tier_rows}
+
+    proc_rows = (
+        db.query(Complaint.ai_processing_status, func.count(Complaint.id))
+        .group_by(Complaint.ai_processing_status)
+        .all()
+    )
+    processing_status_counts = {str(s): int(cnt) for s, cnt in proc_rows}
+
+    recent_fb = (
+        db.query(AIFeedback)
+        .order_by(AIFeedback.created_at.desc())
+        .limit(15)
+        .all()
+    )
+    return {
+        "total_analyzed": total_analyzed,
+        "provider_distribution": provider_distribution,
+        "staff_override_count": override_count,
+        "staff_override_rate_percent": override_rate,
+        "cross_modal_disagreement_count": mismatch_count,
+        "failed_analysis_count": processing_status_counts.get("FAILED", 0),
+        "processing_status_counts": processing_status_counts,
+        "confidence_tiers": confidence_tiers,
+        "evaluation_note": (
+            "Staff Override Rate measures how frequently municipal reviewers altered AI suggestions; "
+            "it is an operational governance metric, not a labelled precision benchmark."
+        ),
+        "recent_feedback": [
+            {
+                "id": fb.id,
+                "complaint_id": fb.complaint_id,
+                "reviewer_name": fb.reviewer.full_name if fb.reviewer else "Staff Reviewer",
+                "original_category": fb.original_category,
+                "corrected_category": fb.corrected_category,
+                "original_priority": fb.original_priority,
+                "corrected_priority": fb.corrected_priority,
+                "original_department_id": fb.original_department_id,
+                "corrected_department_id": fb.corrected_department_id,
+                "corrected_image_assessment": fb.corrected_image_assessment,
+                "reason": fb.reason,
+                "created_at": fb.created_at.isoformat(),
+            }
+            for fb in recent_fb
+        ],
+    }
 
 @router.post("/complaints/{complaint_id}/resolution", response_model=ComplaintResponse)
 def submit_resolution(
@@ -590,6 +761,8 @@ def submit_resolution(
     complaint = db.query(Complaint).filter(Complaint.id == complaint_id).first()
     if not complaint:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Complaint not found")
+
+    enforce_complaint_staff_access(db, current_user, complaint)
 
     resolution = ResolutionSubmission(
         complaint_id=complaint.id,
@@ -611,14 +784,14 @@ def submit_resolution(
     )
     db.add(history)
 
-    # Notify Citizen that repair is completed and awaiting their approval
     send_notification(
         db=db,
         user_id=complaint.citizen_id,
         title="Repair Completed — Please Verify",
         message=f"Remediation on #{complaint.reference_number} is completed. Please review after-repair evidence and confirm.",
         notification_type=NotificationType.RESOLUTION_READY.value,
-        complaint_id=complaint.id
+        complaint_id=complaint.id,
+        commit=False,
     )
 
     log_audit(
@@ -627,22 +800,37 @@ def submit_resolution(
         entity_type="COMPLAINT",
         entity_id=complaint.id,
         user_id=current_user.id,
-        details={"notes": data.resolution_notes}
+        details={"notes": data.resolution_notes},
+        commit=False,
     )
+
+    email_job = None
+    if complaint.citizen and complaint.citizen.email:
+        from app.services.jobs.queue import create_outbox_job
+
+        email_job = create_outbox_job(
+            db=db,
+            job_type="send_email",
+            dedup_key=f"res_ready:{complaint.id}",
+            complaint_id=complaint.id,
+            payload={
+                "template": "resolution_ready",
+                "to_email": complaint.citizen.email,
+                "citizen_name": complaint.citizen.full_name or "Citizen",
+                "reference_number": complaint.reference_number,
+                "completion_notes": data.resolution_notes,
+                "complaint_id": complaint.id,
+            },
+            commit=False,
+        )
 
     db.commit()
     db.refresh(complaint)
 
-    # Enqueue async email verification request (non-blocking)
-    if complaint.citizen and complaint.citizen.email:
-        background_tasks.add_task(
-            email_service.send_resolution_awaiting_verification,
-            to_email=complaint.citizen.email,
-            citizen_name=complaint.citizen.full_name or "Citizen",
-            reference_number=complaint.reference_number,
-            completion_notes=data.resolution_notes,
-            complaint_id=complaint.id
-        )
+    if email_job is not None:
+        from app.services.jobs.queue import dispatch_or_execute_outbox_job
+
+        background_tasks.add_task(dispatch_or_execute_outbox_job, email_job.id)
 
     return complaint
 
@@ -676,6 +864,8 @@ def get_map_complaints(
             if department_id and department_id != user_dept_id:
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
             query = query.filter(or_(Complaint.department_id == user_dept_id, Complaint.department_id == None))
+        else:
+            query = query.filter(Complaint.department_id == None)
 
     if category:
         query = query.filter(Complaint.category == category)
@@ -716,6 +906,39 @@ def get_map_complaints(
             "first_image": c.attachments[0].file_path if c.attachments else None
         })
     return {"complaints": features}
+
+
+@router.get("/analytics/hotspots")
+def get_map_hotspots(
+    category: Optional[str] = None,
+    status: Optional[str] = None,
+    priority: Optional[str] = None,
+    department_id: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    overdue_only: bool = False,
+    grid_size_meters: int = Query(500, ge=100, le=5000),
+    current_user: User = Depends(require_any_staff),
+    db: Session = Depends(get_db),
+):
+    """
+    Privacy-preserving geographic complaint hotspot aggregation enforcing identical
+    department & crew scoping as operational map views. Excludes all citizen PII.
+    """
+    from app.services.maps.hotspots import compute_spatial_hotspots
+
+    return compute_spatial_hotspots(
+        db=db,
+        current_user=current_user,
+        grid_size_meters=grid_size_meters,
+        category=category,
+        priority=priority,
+        status=status,
+        department_id=department_id,
+        date_from=date_from,
+        date_to=date_to,
+        overdue_only=overdue_only,
+    )
 
 # ----------------- USER ADMINISTRATION & RBAC -----------------
 
@@ -820,13 +1043,28 @@ def deactivate_user(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
     user.is_active = False
-    
+
+    now = datetime.now(timezone.utc)
+    (
+        db.query(RefreshToken)
+        .filter(RefreshToken.user_id == user.id, RefreshToken.is_revoked == False)
+        .update(
+            {
+                RefreshToken.is_revoked: True,
+                RefreshToken.revoked_at: now,
+                RefreshToken.revoked_reason: "account_deactivated",
+            },
+            synchronize_session=False,
+        )
+    )
+
     log_audit(
         db=db,
         action="USER_DEACTIVATED",
         entity_type="USER",
         entity_id=user.id,
-        user_id=current_user.id
+        user_id=current_user.id,
+        commit=False,
     )
 
     db.commit()
@@ -839,28 +1077,63 @@ def get_departments(
     current_user: User = Depends(require_any_staff),
     db: Session = Depends(get_db)
 ):
-    """Lists all municipal departments with complaint counts."""
-    departments = db.query(MunicipalDepartment).all()
-    results = []
-    for d in departments:
-        members_count = db.query(DepartmentMembership).filter(DepartmentMembership.department_id == d.id).count()
-        crews_count = db.query(CrewProfile).filter(CrewProfile.department_id == d.id).count()
-        open_count = db.query(Complaint).filter(Complaint.department_id == d.id, Complaint.status.notin_(["RESOLVED", "CANCELLED"])).count()
-        
-        results.append(DepartmentResponse(
+    """Lists municipal departments with grouped member, crew, and open complaint counts (no N+1 loop)."""
+    member_subq = (
+        db.query(
+            DepartmentMembership.department_id.label("dept_id"),
+            func.count(DepartmentMembership.id).label("cnt"),
+        )
+        .group_by(DepartmentMembership.department_id)
+        .subquery()
+    )
+    crew_subq = (
+        db.query(
+            CrewProfile.department_id.label("dept_id"),
+            func.count(CrewProfile.id).label("cnt"),
+        )
+        .group_by(CrewProfile.department_id)
+        .subquery()
+    )
+    open_subq = (
+        db.query(
+            Complaint.department_id.label("dept_id"),
+            func.count(Complaint.id).label("cnt"),
+        )
+        .filter(Complaint.status.notin_([ComplaintStatus.RESOLVED.value, ComplaintStatus.CANCELLED.value]))
+        .group_by(Complaint.department_id)
+        .subquery()
+    )
+
+    rows = (
+        db.query(
+            MunicipalDepartment,
+            func.coalesce(member_subq.c.cnt, 0).label("member_count"),
+            func.coalesce(crew_subq.c.cnt, 0).label("crew_count"),
+            func.coalesce(open_subq.c.cnt, 0).label("open_complaints_count"),
+        )
+        .outerjoin(member_subq, member_subq.c.dept_id == MunicipalDepartment.id)
+        .outerjoin(crew_subq, crew_subq.c.dept_id == MunicipalDepartment.id)
+        .outerjoin(open_subq, open_subq.c.dept_id == MunicipalDepartment.id)
+        .all()
+    )
+
+    return [
+        DepartmentResponse(
             id=d.id,
             name=d.name,
             code=d.code,
             description=d.description,
+            jurisdiction=d.jurisdiction,
             contact_email=d.contact_email,
             contact_phone=d.contact_phone,
             is_active=d.is_active,
             created_at=d.created_at,
-            member_count=members_count,
-            crew_count=crews_count,
-            open_complaints_count=open_count
-        ))
-    return results
+            member_count=int(m_cnt or 0),
+            crew_count=int(c_cnt or 0),
+            open_complaints_count=int(o_cnt or 0),
+        )
+        for d, m_cnt, c_cnt, o_cnt in rows
+    ]
 
 @router.post("/departments", response_model=DepartmentResponse, status_code=status.HTTP_201_CREATED)
 def create_department(
@@ -973,6 +1246,8 @@ def create_work_order(
     if not complaint:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Complaint not found")
 
+    enforce_complaint_department_scope(current_user, complaint)
+
     crew = db.query(User).filter(User.id == data.crew_id, User.role == UserRole.FIELD_CREW.value).first()
     if not crew:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Field crew member not found")
@@ -991,18 +1266,21 @@ def create_work_order(
         scheduled_date=data.scheduled_date or datetime.now(timezone.utc)
     )
     db.add(wo)
+    db.flush()
 
-    # Link crew to complaint and update status
+    # Link crew to complaint and capture real prior status before update
+    old_status = complaint.status
     complaint.assigned_crew_id = crew.id
+    if not complaint.department_id:
+        complaint.department_id = dept.id
     complaint.status = ComplaintStatus.IN_PROGRESS.value
 
-    # Update crew active task count
     if crew.crew_profile:
         crew.crew_profile.active_task_count += 1
 
     history = ComplaintStatusHistory(
         complaint_id=complaint.id,
-        from_status=ComplaintStatus.ASSIGNED.value,
+        from_status=old_status,
         to_status=ComplaintStatus.IN_PROGRESS.value,
         changed_by_id=current_user.id,
         change_reason=f"Work order dispatched to field crew {crew.full_name}",
@@ -1010,14 +1288,14 @@ def create_work_order(
     )
     db.add(history)
 
-    # Notify crew
     send_notification(
         db=db,
         user_id=crew.id,
         title="New Work Order Assigned",
         message=f"Work order #{complaint.reference_number}: {data.title} assigned to you.",
         notification_type=NotificationType.WORK_ORDER_ASSIGNED.value,
-        complaint_id=complaint.id
+        complaint_id=complaint.id,
+        commit=False,
     )
 
     log_audit(
@@ -1026,7 +1304,8 @@ def create_work_order(
         entity_type="WORK_ORDER",
         entity_id=wo.id,
         user_id=current_user.id,
-        details={"crew_id": crew.id, "complaint_id": complaint.id}
+        details={"crew_id": crew.id, "complaint_id": complaint.id},
+        commit=False,
     )
 
     db.commit()
@@ -1070,6 +1349,8 @@ def update_work_order_status(
 
     if current_user.role == UserRole.FIELD_CREW.value and wo.crew_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can only update your assigned work orders")
+    if current_user.role == UserRole.MUNICIPAL_MEMBER.value and wo.complaint:
+        enforce_complaint_department_scope(current_user, wo.complaint)
 
     wo.status = data.status.value
     if data.blocker_reason:
@@ -1137,6 +1418,8 @@ def accept_work_order(
 
     if current_user.role == UserRole.FIELD_CREW.value and wo.crew_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied: Work order not assigned to you")
+    if current_user.role == UserRole.MUNICIPAL_MEMBER.value and wo.complaint:
+        enforce_complaint_department_scope(current_user, wo.complaint)
 
     wo.status = WorkOrderStatus.ACCEPTED.value
     wo.updated_at = datetime.now(timezone.utc)
@@ -1193,6 +1476,8 @@ def submit_work_order_evidence(
 
     if current_user.role == UserRole.FIELD_CREW.value and wo.crew_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied: Work order not assigned to you")
+    if current_user.role == UserRole.MUNICIPAL_MEMBER.value and wo.complaint:
+        enforce_complaint_department_scope(current_user, wo.complaint)
 
     wo.status = WorkOrderStatus.WORK_COMPLETED_PENDING_REVIEW.value
     wo.completion_date = datetime.now(timezone.utc)
@@ -1305,10 +1590,12 @@ def review_duplicate(
     if data.status == DuplicateStatus.CONFIRMED_MERGED:
         dup_complaint = record.duplicate_complaint
         if dup_complaint:
+            enforce_complaint_department_scope(current_user, dup_complaint)
+            prev_dup_status = dup_complaint.status
             dup_complaint.status = ComplaintStatus.CANCELLED.value
             history = ComplaintStatusHistory(
                 complaint_id=dup_complaint.id,
-                from_status=dup_complaint.status,
+                from_status=prev_dup_status,
                 to_status=ComplaintStatus.CANCELLED.value,
                 changed_by_id=current_user.id,
                 change_reason=f"Merged as duplicate into #{record.primary_complaint.reference_number}",
@@ -1336,7 +1623,18 @@ def export_complaints_csv(
     db: Session = Depends(get_db)
 ):
     """Exports authorized complaint dataset to CSV format for municipal reporting."""
-    complaints = db.query(Complaint).order_by(Complaint.created_at.desc()).all()
+    query = db.query(Complaint)
+    if current_user.role == UserRole.MUNICIPAL_MEMBER.value:
+        if current_user.department_membership:
+            query = query.filter(
+                or_(
+                    Complaint.department_id == current_user.department_membership.department_id,
+                    Complaint.department_id.is_(None),
+                )
+            )
+        else:
+            query = query.filter(Complaint.department_id.is_(None))
+    complaints = query.order_by(Complaint.created_at.desc()).all()
     
     output = io.StringIO()
     writer = csv.writer(output)
@@ -1378,4 +1676,54 @@ def get_audit_logs(
     """Government Admin reviews immutable audit trail."""
     logs = db.query(AuditLog).order_by(AuditLog.created_at.desc()).limit(limit).all()
     return logs
+
+
+@router.get("/queue/status")
+def get_admin_queue_and_sla_status(
+    current_user: User = Depends(require_government_admin),
+    db: Session = Depends(get_db),
+):
+    """Reports transactional background queue backlog and deduplicated SLA breach summary."""
+    from app.services.jobs.queue import check_queue_and_worker_health
+
+    health = check_queue_and_worker_health(db)
+    recent_breaches = (
+        db.query(SLABreachEvent)
+        .order_by(SLABreachEvent.detected_at.desc())
+        .limit(10)
+        .all()
+    )
+    return {
+        "status": health["status"],
+        "durable_queue": health["durable_queue"],
+        "redis_connected": health["redis_connected"],
+        "worker_alive": health["worker_alive"],
+        "worker_last_heartbeat": health["worker_last_heartbeat"],
+        "warnings": health["warnings"],
+        "queue": health["queue"],
+        "rate_limiter_mode": health["rate_limiter_mode"],
+        "sla_breach_events_total": db.query(SLABreachEvent).count(),
+        "recent_breaches": [
+            {
+                "id": b.id,
+                "complaint_id": b.complaint_id,
+                "priority": b.priority,
+                "hours_overdue": b.hours_overdue,
+                "detected_at": b.detected_at.isoformat(),
+                "notification_sent": b.notification_sent,
+            }
+            for b in recent_breaches
+        ],
+    }
+
+
+@router.post("/sla/check")
+def trigger_sla_monitoring_cycle(
+    current_user: User = Depends(require_government_admin),
+    db: Session = Depends(get_db),
+):
+    """Allows Government Admin to run an on-demand deduplicated SLA breach scan cleanly."""
+    from app.services.sla.monitor import monitor_sla_deadlines
+
+    return monitor_sla_deadlines(db=db, enqueue_emails=True)
 

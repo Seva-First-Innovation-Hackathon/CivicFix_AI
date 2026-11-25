@@ -22,6 +22,16 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 def get_url():
+    cfg_url = (config.get_main_option("sqlalchemy.url") or "").strip()
+    if cfg_url and not cfg_url.startswith("driver://"):
+        return cfg_url
+    env_url = os.getenv("DATABASE_URL", "").strip()
+    if env_url:
+        if env_url.startswith("postgres://"):
+            env_url = env_url.replace("postgres://", "postgresql://", 1)
+        if env_url.startswith("postgresql://"):
+            return env_url.replace("postgresql://", "postgresql+psycopg2://", 1)
+        return env_url
     return settings.DATABASE_URL
 
 def run_migrations_offline() -> None:

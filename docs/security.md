@@ -88,9 +88,9 @@ async def require_role(required_roles: list[UserRole]):
 To prevent unauthorized takeover and shadow administrative accounts, CivicFix AI enforces a **Single-Admin Invariant**:
 
 1. **No Public Admin Registration**: The `/api/v1/auth/register` endpoint rejects any registration payload requesting non-`CITIZEN` roles with an immediate `400 Bad Request`.
-2. **Secure CLI Provisioning**: The initial Government Admin must be provisioned using `backend/bootstrap.py`:
+2. **Secure CLI Provisioning**: The initial Government Admin must be provisioned using `backend/bootstrap.py` with a strong secret injected via `INITIAL_ADMIN_PASSWORD` or CLI flag:
    ```bash
-   python backend/bootstrap.py --email admin@civicfix.gov --password "SecureAdminPass123!" --name "Chief Municipal Administrator"
+   python backend/bootstrap.py --email admin@civicfix.gov --password "$INITIAL_ADMIN_PASSWORD" --name "Chief Municipal Administrator"
    ```
 3. **Idempotent Invariant Check**: If an administrator already exists in the database, `bootstrap.py` immediately exits with exit code `1`:
    ```
@@ -144,14 +144,8 @@ To protect against malicious file uploads and directory traversal attacks:
 
 1. **MIME Validation**: Allowed extensions and MIME headers are strictly limited to `image/jpeg`, `image/png`, and `image/webp`. Executable files (`.exe`, `.sh`, `.php`, `.js`) and HTML files are rejected.
 2. **Size Enforcement**: Enforces a strict **10 MB limit** per attachment.
-3. **Filename Sanitization & Path Traversal Prevention**:
-   ```python
-   # Original client filenames are stripped using secure_filename()
-   safe_name = secure_filename(file.filename)
-   # Stored on disk under a unique UUID prefix:
-   stored_name = f"{uuid.uuid4()}_{safe_name}"
-   ```
-4. **Isolated Storage**: Files are stored in dedicated directories (`uploads/complaints/`, `uploads/resolutions/`) outside the source tree.
+3. **Pillow Sanitization & Opaque Server Keys**: Re-encodes pixel buffers with Pillow to strip EXIF/GPS metadata, stores opaque UUID object keys under approved folders (`complaints`, `resolutions`, `evidence`), records SHA-256 checksums, and rejects path traversal (`..`, backslashes).
+4. **Private Durable Storage & RBAC Gate**: Production buckets (`r2` / `s3`) remain strictly private with zero `public-read` ACLs and zero `VITE_*` credentials. Every read passes `authorize_and_resolve_attachment` (`/api/v1/evidence/{id}` or `/uploads/...`), streaming authorized bytes or issuing short-lived presigned URLs only after ownership/department/crew authorization succeeds.
 
 ---
 
@@ -173,4 +167,17 @@ Every state-altering event is captured in the `audit_logs` table:
 - **Recorded Fields**: `id`, `user_id`, `action`, `resource_type`, `resource_id`, `ip_address`, `details`, `created_at`.
 - **Logged Actions**: `AUTH_LOGIN`, `CREATE_COMPLAINT`, `AI_OVERRIDE`, `ASSIGN_DEPARTMENT`, `DISPATCH_CREW`, `SUBMIT_RESOLUTION`, `CONFIRM_RESOLUTION`, `REOPEN_COMPLAINT`.
 - **Integrity**: Audit logs are insert-only; no API or UI interface supports updating or deleting audit entries.
+
+---
+
+## 9. Manual Credential Rotation Checklist (Post-Hardening Operations)
+
+Deleting legacy default credentials or demo passwords from source control does **not** alter password hashes, tokens, or secrets already persisted in a running database or external cloud provider. Before promoting any long-lived environment to production:
+
+1. **Application JWT Signing (`SECRET_KEY`)**: Generate a fresh cryptographically random secret (`openssl rand -hex 32`), deploy it, and expect all previously issued access/refresh tokens to become invalid.
+2. **Existing Database Accounts**: For any environment where legacy demo/seed accounts were previously loaded, force password resets on `GOVERNMENT_ADMIN`, `MUNICIPAL_MEMBER`, `FIELD_CREW`, and seeded citizen accounts directly in Postgres and set `is_revoked = true` across `refresh_tokens`.
+3. **Database Credentials (`DATABASE_URL`)**: Rotate the PostgreSQL password in the managed database control panel and update both Web and Worker `DATABASE_URL` environment secrets.
+4. **Cloudflare R2 (`R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY`)**: Issue a fresh private bucket-scoped API token in Cloudflare R2 and revoke prior keys.
+5. **Redis & Rate Limiter (`REDIS_URL`)**: Rotate Redis authentication password/token across Web and Worker services simultaneously.
+6. **External Provider Keys (`GOOGLE_API_KEY`, `SMTP_PASSWORD`)**: Rotate keys in Google AI Studio and the SMTP relay provider, update server-side environment secrets, and restart both Web and Worker processes.
 

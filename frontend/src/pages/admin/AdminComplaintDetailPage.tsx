@@ -45,6 +45,10 @@ export const AdminComplaintDetailPage: React.FC = () => {
   const [overrideReason, setOverrideReason] = useState<string>('');
   const [overrideCategory, setOverrideCategory] = useState<string>('');
   const [overridePriority, setOverridePriority] = useState<string>('');
+  const [overrideDeptId, setOverrideDeptId] = useState<string>('');
+  const [overrideImageNote, setOverrideImageNote] = useState<string>('');
+  const [reanalyzeLoading, setReanalyzeLoading] = useState<boolean>(false);
+  const [compareLoading, setCompareLoading] = useState<boolean>(false);
 
   // Internal Note form
   const [internalNoteContent, setInternalNoteContent] = useState<string>('');
@@ -93,7 +97,7 @@ export const AdminComplaintDetailPage: React.FC = () => {
   }, [id]);
 
   // Auth token for evidence rendering
-  const token = localStorage.getItem('token') || '';
+  const token = localStorage.getItem('civicfix_token') || '';
 
   // 1. Verify Complaint & Set Priority
   const handleVerifyComplaint = async () => {
@@ -227,16 +231,51 @@ export const AdminComplaintDetailPage: React.FC = () => {
         id,
         overrideReason,
         overrideCategory || undefined,
-        overridePriority || undefined
+        overridePriority || undefined,
+        overrideDeptId || undefined,
+        overrideImageNote || undefined,
       );
       setComplaint(updated);
       setShowOverrideModal(false);
       setOverrideReason('');
-      success('AI Assessment Overridden', 'Audit record generated successfully.');
+      setOverrideDeptId('');
+      setOverrideImageNote('');
+      success('AI Assessment Overridden', 'Structured feedback and audit record saved.');
     } catch (err: any) {
       toastError('Override Failed', err.message);
     } finally {
       setActionLoading(false);
+    }
+  };
+
+  // 7b. Retry / Re-run Async AI Triage
+  const handleReanalyzeAi = async () => {
+    if (!id) return;
+    setReanalyzeLoading(true);
+    try {
+      const updated = await complaintsService.reanalyzeAi(id);
+      setComplaint(updated);
+      success('AI Re-analysis Queued', 'Background AI assessment has been scheduled.');
+      loadData();
+    } catch (err: any) {
+      toastError('AI Retry Blocked', err.message);
+    } finally {
+      setReanalyzeLoading(false);
+    }
+  };
+
+  // 7c. Compare Before/After Evidence
+  const handleCompareEvidence = async () => {
+    if (!id) return;
+    setCompareLoading(true);
+    try {
+      await adminService.compareEvidence(id);
+      success('Visual Comparison Generated', 'Advisory before/after inspection attached.');
+      loadData();
+    } catch (err: any) {
+      toastError('Comparison Failed', err.message);
+    } finally {
+      setCompareLoading(false);
     }
   };
 
@@ -307,9 +346,16 @@ export const AdminComplaintDetailPage: React.FC = () => {
             <h1 className="text-2xl font-extrabold text-slate-900 mt-1">{complaint.title}</h1>
           </div>
           {complaint.sla_deadline && (
-            <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-600 bg-white border border-slate-200 px-3 py-1.5 rounded-xl shadow-xs self-start sm:self-auto">
-              <Clock className="w-3.5 h-3.5 text-brand-600" />
-              <span>SLA Target: {new Date(complaint.sla_deadline).toLocaleString()}</span>
+            <div className={`flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-xl shadow-xs self-start sm:self-auto border ${
+              complaint.is_overdue
+                ? 'text-rose-700 bg-rose-50 border-rose-200'
+                : 'text-slate-600 bg-white border-slate-200'
+            }`}>
+              <Clock className={`w-3.5 h-3.5 ${complaint.is_overdue ? 'text-rose-600' : 'text-brand-600'}`} />
+              <span>
+                SLA Target: {new Date(complaint.sla_deadline).toLocaleString()}
+                {complaint.is_overdue ? ` • OVERDUE (${complaint.hours_overdue ?? 0}h)` : ''}
+              </span>
             </div>
           )}
         </div>
@@ -496,6 +542,35 @@ export const AdminComplaintDetailPage: React.FC = () => {
             </div>
           </div>
 
+          {/* Async AI Processing Status Banner */}
+          <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 text-xs">
+              <Sparkles className="w-4 h-4 text-ai-600" />
+              <span className="font-bold text-slate-700">AI Triage Queue State:</span>
+              <span className={`px-2 py-0.5 rounded-full font-mono text-[11px] font-bold ${
+                complaint.ai_processing_status === 'COMPLETED'
+                  ? 'bg-emerald-100 text-emerald-800'
+                  : complaint.ai_processing_status === 'FAILED'
+                    ? 'bg-rose-100 text-rose-800'
+                    : 'bg-amber-100 text-amber-800'
+              }`}>
+                {complaint.ai_processing_status || 'PENDING'}
+              </span>
+              {complaint.ai_processing_error && (
+                <span className="text-rose-700 truncate max-w-md">{complaint.ai_processing_error}</span>
+              )}
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              isLoading={reanalyzeLoading}
+              disabled={complaint.ai_processing_status === 'PROCESSING'}
+              onClick={handleReanalyzeAi}
+            >
+              Re-run AI Analysis
+            </Button>
+          </div>
+
           {/* AI Intelligence Assessment Panel */}
           {complaint.ai_analysis && (
             <div className="bg-gradient-to-br from-ai-50/60 to-white p-6 rounded-3xl border border-ai-200 shadow-xs space-y-4">
@@ -508,6 +583,7 @@ export const AdminComplaintDetailPage: React.FC = () => {
                     <h3 className="text-sm font-bold text-slate-900">AI Triage Intelligence</h3>
                     <p className="text-[10px] text-ai-700 font-mono">
                       Model: {complaint.ai_analysis.model_name} • {Math.round(complaint.ai_analysis.confidence_score * 100)}% Confidence
+                      {complaint.ai_analysis.routing_tier ? ` • ${complaint.ai_analysis.routing_tier.replace(/_/g, ' ')}` : ''}
                     </p>
                   </div>
                 </div>
@@ -521,11 +597,21 @@ export const AdminComplaintDetailPage: React.FC = () => {
                 </Button>
               </div>
 
+              {complaint.ai_analysis.cross_modal_mismatch && (
+                <div className="p-3 bg-amber-50 rounded-xl border border-amber-300 text-xs text-amber-900 flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                  <div>
+                    <strong>Image/Text Category Disagreement Flagged for Review:</strong>{' '}
+                    {complaint.ai_analysis.cross_modal_explanation || 'Uploaded photograph diverges from text description category.'}
+                  </div>
+                </div>
+              )}
+
               <div className="p-3.5 bg-white/90 rounded-2xl border border-ai-100 text-xs text-slate-700 leading-relaxed">
                 {complaint.ai_analysis.summary_explanation}
               </div>
 
-              <div className="grid grid-cols-3 gap-2 text-xs">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
                 <div className="p-2.5 bg-white rounded-xl border border-ai-100">
                   <span className="text-[10px] text-slate-400 block uppercase font-semibold">Suggested Priority</span>
                   <span className="font-bold text-slate-900">{complaint.ai_analysis.suggested_priority}</span>
@@ -538,6 +624,12 @@ export const AdminComplaintDetailPage: React.FC = () => {
                   <span className="text-[10px] text-slate-400 block uppercase font-semibold">Safety Hazard</span>
                   <span className={`font-bold ${complaint.ai_analysis.safety_hazard_detected ? 'text-rose-600' : 'text-slate-800'}`}>
                     {complaint.ai_analysis.safety_hazard_detected ? 'Detected' : 'None'}
+                  </span>
+                </div>
+                <div className="p-2.5 bg-white rounded-xl border border-ai-100">
+                  <span className="text-[10px] text-slate-400 block uppercase font-semibold">Advisory Routing</span>
+                  <span className="font-bold text-slate-800">
+                    {(complaint.ai_analysis.recommended_action || 'REQUIRE_VERIFICATION').replace(/_/g, ' ')}
                   </span>
                 </div>
               </div>
@@ -748,7 +840,10 @@ export const AdminComplaintDetailPage: React.FC = () => {
                         }`}>
                           {att.attachment_type}
                         </span>
-                        <span>{(att.file_size / (1024 * 1024)).toFixed(2)} MB</span>
+                        <span>
+                          {(att.file_size / (1024 * 1024)).toFixed(2)} MB
+                          {att.storage_provider ? ` • ${att.storage_provider.toUpperCase()}` : ''}
+                        </span>
                       </div>
                       {att.description && (
                         <div className="px-2 pb-2 text-[11px] text-slate-600">
@@ -761,6 +856,40 @@ export const AdminComplaintDetailPage: React.FC = () => {
               </div>
             ) : (
               <p className="text-xs text-slate-400 text-center py-6">No photographs attached.</p>
+            )}
+          </div>
+
+          {/* Advisory Before/After Evidence Comparison */}
+          <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-xs space-y-3">
+            <div className="flex items-center justify-between">
+              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">Before / After Comparison</h3>
+              <Button
+                variant="outline"
+                size="sm"
+                isLoading={compareLoading}
+                onClick={handleCompareEvidence}
+              >
+                Compare Photos
+              </Button>
+            </div>
+            {complaint.resolution_comparisons && complaint.resolution_comparisons.length > 0 ? (
+              <div className="space-y-2 text-xs">
+                <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-slate-700">
+                  <p className="font-semibold text-slate-900 mb-1">
+                    {complaint.resolution_comparisons[0].changes_detected
+                      ? 'Visual Changes Detected (Human Verification Required)'
+                      : 'Minimal Coarse Differences Observed'}
+                  </p>
+                  <p>{complaint.resolution_comparisons[0].summary}</p>
+                </div>
+                <p className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded-xl p-2.5">
+                  {complaint.resolution_comparisons[0].uncertainty_notes}
+                </p>
+              </div>
+            ) : (
+              <p className="text-[11px] text-slate-500">
+                Requires both a before-repair image and an after-repair / resolution photo to run advisory visual comparison.
+              </p>
             )}
           </div>
 
@@ -1067,6 +1196,31 @@ export const AdminComplaintDetailPage: React.FC = () => {
                   <option value="P3">P3 Normal (72h)</option>
                   <option value="P4">P4 Low (168h)</option>
                 </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">Override Department</label>
+                <select
+                  value={overrideDeptId}
+                  onChange={(e) => setOverrideDeptId(e.target.value)}
+                  className="w-full p-2.5 border border-slate-300 rounded-xl text-xs bg-white text-slate-800"
+                >
+                  <option value="">(Keep Current Department)</option>
+                  {departments.map((d) => (
+                    <option key={d.id} value={d.id}>{d.name}</option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">Image Assessment Correction (Optional)</label>
+                <input
+                  type="text"
+                  value={overrideImageNote}
+                  onChange={(e) => setOverrideImageNote(e.target.value)}
+                  placeholder="Optional correction to visual evidence interpretation..."
+                  className="w-full p-2.5 border border-slate-300 rounded-xl text-xs"
+                />
               </div>
 
               <div>

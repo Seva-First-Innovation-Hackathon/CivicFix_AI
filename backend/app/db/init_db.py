@@ -1,56 +1,33 @@
+"""
+CivicFix AI — Application Startup Database Helpers
+
+Schema creation and DDL migrations are owned exclusively by Alembic (`backend/migrate.py`).
+This module contains only idempotent runtime data initialization executed safely inside
+the FastAPI lifespan context.
+"""
 import logging
-from sqlalchemy import inspect, text
-from app.db.session import engine, Base
-import app.models.entities
+from sqlalchemy.orm import Session
+from app.models.entities import MunicipalDepartment
 
 logger = logging.getLogger(__name__)
 
-def ensure_schema_upgrades():
-    """
-    Ensures all database tables and new Phase 2 columns exist.
-    Performs safe incremental schema alterations for existing databases.
-    """
-    Base.metadata.create_all(bind=engine)
-    
-    with engine.connect() as conn:
-        inspector = inspect(engine)
-        tables = inspector.get_table_names()
-        
-        # 1. complaints table columns
-        if "complaints" in tables:
-            complaint_cols = [c["name"] for c in inspector.get_columns("complaints")]
-            new_complaint_cols = [
-                ("cancellation_reason", "TEXT"),
-                ("rejection_reason", "TEXT"),
-                ("investigation_notes", "TEXT"),
-                ("clarification_requested", "TEXT"),
-            ]
-            for col_name, col_type in new_complaint_cols:
-                if col_name not in complaint_cols:
-                    conn.execute(text(f"ALTER TABLE complaints ADD COLUMN {col_name} {col_type}"))
-                    conn.commit()
+DEFAULT_DEPARTMENTS = [
+    ("Roads and Public Works", "ROADS", "Road surface, potholes, bridges, and vehicular corridors"),
+    ("Street Lighting & Electrical", "LIGHTING", "Illumination luminaires, streetlights, and electrical poles"),
+    ("Sanitation & Solid Waste", "SANITATION", "Waste collection, litter removal, and public hygiene"),
+    ("Water Supply & Distribution", "WATER", "Drinking water network, pipelines, and valves"),
+    ("Drainage & Flood Management", "DRAINAGE", "Stormwater drains, culverts, and monsoon waterlogging"),
+    ("Parks & Urban Forestry", "PARKS", "Urban tree cover, parks, and fallen arbor hazards"),
+]
 
-        # 2. municipal_departments columns
-        if "municipal_departments" in tables:
-            dept_cols = [c["name"] for c in inspector.get_columns("municipal_departments")]
-            if "jurisdiction" not in dept_cols:
-                conn.execute(text("ALTER TABLE municipal_departments ADD COLUMN jurisdiction VARCHAR(255) DEFAULT 'City-wide'"))
-                conn.commit()
 
-        # 3. department_memberships columns
-        if "department_memberships" in tables:
-            mem_cols = [c["name"] for c in inspector.get_columns("department_memberships")]
-            if "jurisdiction" not in mem_cols:
-                conn.execute(text("ALTER TABLE department_memberships ADD COLUMN jurisdiction VARCHAR(255) DEFAULT 'City-wide'"))
-                conn.commit()
-
-        # 4. complaint_attachments columns
-        if "complaint_attachments" in tables:
-            att_cols = [c["name"] for c in inspector.get_columns("complaint_attachments")]
-            if "is_internal" not in att_cols:
-                conn.execute(text("ALTER TABLE complaint_attachments ADD COLUMN is_internal BOOLEAN DEFAULT FALSE"))
-                conn.commit()
-            if "description" not in att_cols:
-                conn.execute(text("ALTER TABLE complaint_attachments ADD COLUMN description VARCHAR(500)"))
-                conn.commit()
-
+def ensure_default_departments(db: Session) -> None:
+    """Idempotently inserts default municipal departments without issuing any schema DDL."""
+    created = False
+    for name, code, desc in DEFAULT_DEPARTMENTS:
+        dept = db.query(MunicipalDepartment).filter(MunicipalDepartment.code == code).first()
+        if not dept:
+            db.add(MunicipalDepartment(name=name, code=code, description=desc, is_active=True))
+            created = True
+    if created:
+        db.commit()

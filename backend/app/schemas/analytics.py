@@ -11,6 +11,8 @@ class KeyMetrics(BaseModel):
     reopened_complaints: int
     high_priority_unresolved: int
     overdue_complaints: int
+    sla_breach_events_count: int = 0
+    queue_backlog_count: int = 0
     average_resolution_hours: float
     citizen_satisfaction_rate: float
 
@@ -25,9 +27,11 @@ class PriorityCount(BaseModel):
     percentage: float
 
 class DepartmentCount(BaseModel):
+    department_id: Optional[str] = None
     department_name: str
     count: int
     resolved_count: int
+    open_count: int = 0
 
 class TrendDataPoint(BaseModel):
     date: str

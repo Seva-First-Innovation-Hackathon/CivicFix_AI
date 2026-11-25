@@ -2,10 +2,11 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional, List
 from sqlalchemy import (
-    Column, String, Text, Boolean, Integer, Float, DateTime, ForeignKey, Index, UniqueConstraint
+    Column, String, Text, Boolean, Integer, Float, DateTime, ForeignKey, Index, UniqueConstraint, event
 )
 from sqlalchemy.orm import relationship
 from app.db.session import Base
+from app.db.spatial_types import format_geog_point_wkt, wgs84_geography_column_type
 from app.models.enums import (
     UserRole, ComplaintCategory, PriorityLevel, ComplaintStatus,
     WorkOrderStatus, DuplicateStatus, NotificationType, AttachmentType, CommentType
@@ -39,6 +40,7 @@ class User(Base):
     assigned_complaints = relationship("Complaint", back_populates="assigned_crew", foreign_keys="Complaint.assigned_crew_id")
     notifications = relationship("Notification", back_populates="user", cascade="all, delete-orphan")
     notification_preferences = relationship("NotificationPreference", back_populates="user", uselist=False, cascade="all, delete-orphan")
+    refresh_tokens = relationship("RefreshToken", back_populates="user", cascade="all, delete-orphan")
 
 class CitizenProfile(Base):
     __tablename__ = "citizen_profiles"
@@ -109,9 +111,10 @@ class Complaint(Base):
     category = Column(String(50), default=ComplaintCategory.OTHER.value, nullable=False, index=True)
     subcategory = Column(String(100), nullable=True)
     
-    # Location coordinates
+    # Location coordinates & PostGIS WGS84 point geography
     latitude = Column(Float, nullable=False, index=True)
     longitude = Column(Float, nullable=False, index=True)
+    location = Column(wgs84_geography_column_type(), nullable=True)
     address = Column(String(255), nullable=True)
     landmark = Column(String(255), nullable=True)
 
@@ -122,7 +125,14 @@ class Complaint(Base):
     assigned_crew_id = Column(String(36), ForeignKey("users.id"), nullable=True, index=True)
     is_disputed = Column(Boolean, default=False, nullable=False)
     sla_deadline = Column(DateTime(timezone=True), nullable=True)
-    
+
+    # Async AI triage execution state
+    ai_processing_status = Column(String(30), default="PENDING", server_default="COMPLETED", nullable=False, index=True)
+    ai_processing_error = Column(Text, nullable=True)
+    ai_processing_attempts = Column(Integer, default=0, server_default="0", nullable=False)
+    ai_processing_started_at = Column(DateTime(timezone=True), nullable=True)
+    ai_processing_completed_at = Column(DateTime(timezone=True), nullable=True)
+
     # Explicit status transition reasons
     cancellation_reason = Column(Text, nullable=True)
     rejection_reason = Column(Text, nullable=True)
@@ -143,6 +153,27 @@ class Complaint(Base):
     resolution_submissions = relationship("ResolutionSubmission", back_populates="complaint", cascade="all, delete-orphan")
     resolution_verifications = relationship("ResolutionVerification", back_populates="complaint", cascade="all, delete-orphan")
     comments = relationship("ComplaintComment", back_populates="complaint", cascade="all, delete-orphan", order_by="ComplaintComment.created_at.asc()")
+    ai_feedback_records = relationship("AIFeedback", back_populates="complaint", cascade="all, delete-orphan", order_by="AIFeedback.created_at.desc()")
+    resolution_comparisons = relationship("ResolutionComparison", back_populates="complaint", cascade="all, delete-orphan", order_by="ResolutionComparison.created_at.desc()")
+
+    @property
+    def is_overdue(self) -> bool:
+        if not self.sla_deadline or self.status in ("RESOLVED", "CANCELLED", "REJECTED"):
+            return False
+        deadline = self.sla_deadline
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) > deadline
+
+    @property
+    def hours_overdue(self) -> Optional[float]:
+        if not self.is_overdue or not self.sla_deadline:
+            return None
+        deadline = self.sla_deadline
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        delta_sec = (datetime.now(timezone.utc) - deadline).total_seconds()
+        return round(max(0.0, delta_sec / 3600.0), 2)
 
 class ComplaintAttachment(Base):
     __tablename__ = "complaint_attachments"
@@ -157,6 +188,11 @@ class ComplaintAttachment(Base):
     is_internal = Column(Boolean, default=False, nullable=False)  # If True, never exposed to citizen
     description = Column(String(500), nullable=True)
     uploaded_by_id = Column(String(36), ForeignKey("users.id"), nullable=False)
+    storage_provider = Column(String(30), default="local", server_default="local", nullable=False, index=True)
+    storage_object_key = Column(String(500), nullable=True, index=True)
+    sha256_checksum = Column(String(64), nullable=True)
+    storage_verification_status = Column(String(30), default="VERIFIED", server_default="PENDING", nullable=False)
+    storage_migrated_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
 
     complaint = relationship("Complaint", back_populates="attachments")
@@ -177,6 +213,12 @@ class AIAnalysis(Base):
     urgency_level = Column(String(50), default="MEDIUM", nullable=False)
     summary_explanation = Column(Text, nullable=False)
     visual_findings = Column(Text, nullable=True)  # JSON formatted findings
+    image_suggested_category = Column(String(50), nullable=True)
+    cross_modal_mismatch = Column(Boolean, default=False, server_default="0", nullable=False)
+    cross_modal_explanation = Column(Text, nullable=True)
+    routing_tier = Column(String(30), default="MEDIUM_CONFIDENCE", server_default="MEDIUM_CONFIDENCE", nullable=False)
+    recommended_action = Column(String(50), default="REQUIRE_VERIFICATION", server_default="REQUIRE_VERIFICATION", nullable=False)
+    suggested_department_id = Column(String(36), ForeignKey("municipal_departments.id", ondelete="SET NULL"), nullable=True)
     duplicate_checked = Column(Boolean, default=True, nullable=False)
     
     # Audit trail for manual override
@@ -190,6 +232,9 @@ class AIAnalysis(Base):
 
 class ComplaintStatusHistory(Base):
     __tablename__ = "complaint_status_history"
+    __table_args__ = (
+        Index("ix_complaint_status_history_complaint_created", "complaint_id", "created_at"),
+    )
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
     complaint_id = Column(String(36), ForeignKey("complaints.id", ondelete="CASCADE"), nullable=False, index=True)
@@ -340,4 +385,118 @@ class SystemSetting(Base):
     description = Column(Text, nullable=True)
     updated_by_id = Column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+class RefreshToken(Base):
+    __tablename__ = "refresh_tokens"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    jti = Column(String(64), unique=True, index=True, nullable=False)
+    token_hash = Column(String(128), unique=True, index=True, nullable=False)
+    family_id = Column(String(64), index=True, nullable=False)
+    parent_jti = Column(String(64), nullable=True)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    is_revoked = Column(Boolean, default=False, nullable=False, index=True)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+    revoked_reason = Column(String(100), nullable=True)
+    replaced_by_jti = Column(String(64), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    user = relationship("User", back_populates="refresh_tokens")
+
+
+class BackgroundJob(Base):
+    """Transactional outbox and durable execution record for async AI, email, and SLA monitoring jobs."""
+    __tablename__ = "background_jobs"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    job_type = Column(String(50), nullable=False, index=True)
+    dedup_key = Column(String(160), nullable=True, index=True)
+    complaint_id = Column(String(36), ForeignKey("complaints.id", ondelete="CASCADE"), nullable=True, index=True)
+    payload_json = Column(Text, nullable=True)
+    status = Column(String(30), default="PENDING_DISPATCH", nullable=False, index=True)
+    attempts = Column(Integer, default=0, nullable=False)
+    max_attempts = Column(Integer, default=3, nullable=False)
+    next_run_at = Column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
+    dispatched_at = Column(DateTime(timezone=True), nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(Text, nullable=True)
+    redis_job_id = Column(String(120), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+
+
+class SLABreachEvent(Base):
+    """Deduplicated record of SLA deadline breaches for accountability, notifications, and analytics."""
+    __tablename__ = "sla_breach_events"
+    __table_args__ = (
+        UniqueConstraint("complaint_id", "sla_deadline", name="uq_sla_breach_complaint_deadline"),
+    )
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    complaint_id = Column(String(36), ForeignKey("complaints.id", ondelete="CASCADE"), nullable=False, index=True)
+    priority = Column(String(10), nullable=False)
+    sla_deadline = Column(DateTime(timezone=True), nullable=False)
+    detected_at = Column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
+    hours_overdue = Column(Float, nullable=False)
+    notification_sent = Column(Boolean, default=False, nullable=False)
+    notified_user_count = Column(Integer, default=0, nullable=False)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    complaint = relationship("Complaint")
+
+
+class AIFeedback(Base):
+    """Structured staff correction log capturing AI overrides for operational audit and evaluation."""
+    __tablename__ = "ai_feedback_records"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    complaint_id = Column(String(36), ForeignKey("complaints.id", ondelete="CASCADE"), nullable=False, index=True)
+    ai_analysis_id = Column(String(36), ForeignKey("ai_analyses.id", ondelete="CASCADE"), nullable=False, index=True)
+    reviewer_id = Column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    original_category = Column(String(50), nullable=True)
+    corrected_category = Column(String(50), nullable=True)
+    original_priority = Column(String(10), nullable=True)
+    corrected_priority = Column(String(10), nullable=True)
+    original_department_id = Column(String(36), nullable=True)
+    corrected_department_id = Column(String(36), nullable=True)
+    original_image_assessment = Column(Text, nullable=True)
+    corrected_image_assessment = Column(Text, nullable=True)
+    reason = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
+
+    complaint = relationship("Complaint", back_populates="ai_feedback_records")
+    reviewer = relationship("User", foreign_keys=[reviewer_id])
+
+
+class ResolutionComparison(Base):
+    """Advisory AI visual comparison between citizen before-repair and crew after-repair evidence."""
+    __tablename__ = "resolution_comparisons"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    complaint_id = Column(String(36), ForeignKey("complaints.id", ondelete="CASCADE"), nullable=False, index=True)
+    before_attachment_id = Column(String(36), ForeignKey("complaint_attachments.id", ondelete="CASCADE"), nullable=False)
+    after_attachment_id = Column(String(36), ForeignKey("complaint_attachments.id", ondelete="CASCADE"), nullable=False)
+    requested_by_id = Column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    provider = Column(String(50), nullable=False)
+    model_name = Column(String(100), nullable=False)
+    changes_detected = Column(Boolean, default=True, nullable=False)
+    visual_differences_json = Column(Text, nullable=False)
+    summary = Column(Text, nullable=False)
+    uncertainty_notes = Column(Text, nullable=False)
+    requires_human_review = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+    complaint = relationship("Complaint", back_populates="resolution_comparisons")
+
+
+def _sync_complaint_location(_mapper, _connection, target: Complaint) -> None:
+    """Keep Complaint.location synchronized with validated latitude and longitude."""
+    target.location = format_geog_point_wkt(target.latitude, target.longitude)
+
+
+event.listen(Complaint, "before_insert", _sync_complaint_location)
+event.listen(Complaint, "before_update", _sync_complaint_location)
 

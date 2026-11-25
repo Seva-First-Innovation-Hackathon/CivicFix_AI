@@ -9,7 +9,7 @@ from app.core.config import settings
 from app.models.enums import ComplaintCategory, PriorityLevel
 from app.services.ai.base import (
     BaseAIProvider, TextAnalysisResult, ImageAnalysisResult,
-    PriorityRecommendation
+    PriorityRecommendation, RepairComparisonResult
 )
 
 logger = logging.getLogger(__name__)
@@ -28,12 +28,23 @@ class GeminiTextOutputSchema(BaseModel):
     extracted_keywords: List[str] = []
 
 class GeminiImageOutputSchema(BaseModel):
+    suggested_category: Optional[str] = Field(
+        None,
+        description="Best matching category: ROADS, STREETLIGHTS, GARBAGE, DRAINAGE, WATER_SUPPLY, FOOTPATHS, TREES_HAZARDS, SANITATION, OTHER",
+    )
     damage_detected: bool = False
     damage_type: str = "none"
     damage_severity: str = Field(description="One of: CRITICAL, HIGH, MEDIUM, LOW, NONE")
     confidence_score: float = Field(ge=0.0, le=1.0)
     observations: List[str] = []
     is_inconclusive: bool = False
+
+
+class GeminiComparisonOutputSchema(BaseModel):
+    changes_detected: bool = False
+    visual_differences: List[str] = []
+    summary: str = ""
+    uncertainty_notes: str = "Human verification required; visual inspection cannot verify subsurface quality."
 
 CATEGORY_MAP: Dict[str, ComplaintCategory] = {
     "ROADS": ComplaintCategory.ROADS,
@@ -144,35 +155,18 @@ class GeminiAIProvider(BaseAIProvider):
             logger.error("Gemini text analysis error: %s", exc, exc_info=True)
             raise AIServiceUnavailableError(f"Gemini API inference error: {str(exc)}") from exc
 
-    async def analyze_image(self, file_path: str) -> ImageAnalysisResult:
+    async def analyze_image(
+        self,
+        file_path: str,
+        image_bytes: Optional[bytes] = None,
+    ) -> ImageAnalysisResult:
         if not self.is_configured():
             raise AIServiceUnavailableError(
                 "Google Gemini AI is not configured. Please set GOOGLE_API_KEY in backend/.env to enable live analysis."
             )
 
-        path = Path(file_path)
-        if not path.is_file():
-            return ImageAnalysisResult(
-                damage_detected=False,
-                damage_type="not_found",
-                damage_severity="NONE",
-                confidence_score=0.0,
-                observations=["Evidence photo could not be read from disk."],
-                is_inconclusive=True
-            )
-
-        # File size check (max 10MB)
-        if path.stat().st_size > 10 * 1024 * 1024:
-            return ImageAnalysisResult(
-                damage_detected=False,
-                damage_type="oversized",
-                damage_severity="NONE",
-                confidence_score=0.0,
-                observations=["Attachment exceeds maximum allowed size for AI analysis (10MB)."],
-                is_inconclusive=True
-            )
-
-        ext = path.suffix.lower()
+        path = Path(file_path or "")
+        ext = path.suffix.lower() or ".jpg"
         mime_map = {
             ".jpg": "image/jpeg",
             ".jpeg": "image/jpeg",
@@ -190,20 +184,41 @@ class GeminiAIProvider(BaseAIProvider):
                 is_inconclusive=True
             )
 
-        from google.genai import types
-
-        try:
+        if image_bytes is None:
+            if not path.is_file():
+                return ImageAnalysisResult(
+                    damage_detected=False,
+                    damage_type="not_found",
+                    damage_severity="NONE",
+                    confidence_score=0.0,
+                    observations=["Evidence photo could not be read from disk."],
+                    is_inconclusive=True
+                )
             with open(path, "rb") as f:
                 image_bytes = f.read()
 
+        if len(image_bytes) > 10 * 1024 * 1024:
+            return ImageAnalysisResult(
+                damage_detected=False,
+                damage_type="oversized",
+                damage_severity="NONE",
+                confidence_score=0.0,
+                observations=["Attachment exceeds maximum allowed size for AI analysis (10MB)."],
+                is_inconclusive=True
+            )
+
+        from google.genai import types
+
+        try:
             image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
 
             prompt = (
                 "You are CivicFix AI, an inspection assistant for municipal infrastructure. "
                 "Inspect this uploaded civic complaint photo for physical damage or civic hazard. "
+                "Classify suggested_category as one of: ROADS, STREETLIGHTS, GARBAGE, DRAINAGE, WATER_SUPPLY, FOOTPATHS, TREES_HAZARDS, SANITATION, OTHER. "
                 "Assess whether damage is present, damage type (e.g. asphalt crater, exposed cable, water leak, garbage accumulation), "
                 "damage severity (CRITICAL, HIGH, MEDIUM, LOW, NONE), confidence score (0.0 to 1.0), and bullet-point observations. "
-                "Return strictly structured JSON matching: damage_detected, damage_type, damage_severity, confidence_score, observations, is_inconclusive."
+                "Return strictly structured JSON matching: suggested_category, damage_detected, damage_type, damage_severity, confidence_score, observations, is_inconclusive."
             )
 
             config = types.GenerateContentConfig(
@@ -220,6 +235,9 @@ class GeminiAIProvider(BaseAIProvider):
             raw_text = response.text or "{}"
             parsed_data = json.loads(raw_text)
             validated = GeminiImageOutputSchema(**parsed_data)
+            mapped_cat = None
+            if validated.suggested_category:
+                mapped_cat = CATEGORY_MAP.get(validated.suggested_category.upper().replace(" ", "_"))
 
             return ImageAnalysisResult(
                 damage_detected=validated.damage_detected,
@@ -227,7 +245,8 @@ class GeminiAIProvider(BaseAIProvider):
                 damage_severity=validated.damage_severity.upper(),
                 confidence_score=max(0.1, min(1.0, validated.confidence_score)),
                 observations=validated.observations[:5],
-                is_inconclusive=validated.is_inconclusive
+                is_inconclusive=validated.is_inconclusive,
+                suggested_category=mapped_cat,
             )
 
         except Exception as exc:
@@ -241,6 +260,50 @@ class GeminiAIProvider(BaseAIProvider):
                 is_inconclusive=True
             )
 
+    @staticmethod
+    def _detect_image_mime(image_bytes: bytes) -> str:
+        """Detects PNG/WebP/JPEG magic headers for direct Gemini binary inspection."""
+        if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if len(image_bytes) >= 12 and image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+            return "image/webp"
+        return "image/jpeg"
+
+    async def compare_before_after_images(
+        self,
+        before_bytes: bytes,
+        after_bytes: bytes,
+        context_title: str = "",
+    ) -> RepairComparisonResult:
+        if not self.is_configured():
+            raise AIServiceUnavailableError("Google Gemini AI is not configured for repair comparison.")
+
+        from google.genai import types
+
+        before_part = types.Part.from_bytes(data=before_bytes, mime_type=self._detect_image_mime(before_bytes))
+        after_part = types.Part.from_bytes(data=after_bytes, mime_type=self._detect_image_mime(after_bytes))
+        prompt = (
+            f"Compare these before-repair and after-repair civic photos for issue '{context_title[:200]}'. "
+            "Do NOT claim certainty if framing/lighting differs and NEVER auto-approve. "
+            "Return JSON with: changes_detected (bool), visual_differences (list of strings), "
+            "summary (concise advisory string), uncertainty_notes (explicit caveats)."
+        )
+        response = self._client.models.generate_content(
+            model=self.model_name,
+            contents=[before_part, after_part, prompt],
+            config=types.GenerateContentConfig(temperature=0.1, response_mime_type="application/json"),
+        )
+        validated = GeminiComparisonOutputSchema(**json.loads(response.text or "{}"))
+        return RepairComparisonResult(
+            changes_detected=validated.changes_detected,
+            visual_differences=validated.visual_differences[:6],
+            summary=validated.summary or "Advisory visual comparison completed.",
+            uncertainty_notes=validated.uncertainty_notes,
+            provider="gemini",
+            model_name=self.model_name,
+            requires_human_review=True,
+        )
+
     async def transcribe_audio(self, file_path: str, language: str = "en") -> str:
         # Audio transcription placeholder for multimodal expansion
         return ""
@@ -252,15 +315,15 @@ class GeminiAIProvider(BaseAIProvider):
         image_result: Optional[ImageAnalysisResult] = None
     ) -> PriorityRecommendation:
         """
-        Calculates municipal priority level (P1-P4) with natural language explainability.
-        Clearly designated as a suggestion requiring human confirmation before high-impact actions.
+        Calculates municipal priority level (P1-P4) deterministically from AI urgency and severity signals.
+        Clearly labeled as deterministic priority policy rather than raw LLM generation.
         """
         # P1: Immediate Emergency
         if text_result.safety_hazard_detected or text_result.urgency_level == "CRITICAL":
             return PriorityRecommendation(
                 priority=PriorityLevel.P1,
                 confidence=0.92,
-                rationale="[Gemini Suggestion] Critical public safety risk detected requiring urgent 12-hour fast-track intervention.",
+                rationale="[Priority Policy] Critical public safety risk detected requiring urgent 12-hour fast-track intervention.",
                 factors_considered={
                     "safety_hazard": True,
                     "urgency": text_result.urgency_level,
@@ -273,7 +336,7 @@ class GeminiAIProvider(BaseAIProvider):
             return PriorityRecommendation(
                 priority=PriorityLevel.P2,
                 confidence=0.88,
-                rationale="[Gemini Suggestion] High structural damage verified via visual evidence; targeted 24-hour turnaround.",
+                rationale="[Priority Policy] High structural damage verified via visual evidence; targeted 24-hour turnaround.",
                 factors_considered={
                     "visual_damage": image_result.damage_type,
                     "severity": image_result.damage_severity
@@ -285,7 +348,7 @@ class GeminiAIProvider(BaseAIProvider):
             return PriorityRecommendation(
                 priority=PriorityLevel.P2,
                 confidence=0.85,
-                rationale="[Gemini Suggestion] Significant civic disruption detected; assigned standard 24-hour SLA.",
+                rationale="[Priority Policy] Significant civic disruption detected; assigned standard 24-hour SLA.",
                 factors_considered={"urgency": text_result.urgency_level}
             )
 
@@ -294,7 +357,7 @@ class GeminiAIProvider(BaseAIProvider):
             return PriorityRecommendation(
                 priority=PriorityLevel.P4,
                 confidence=0.80,
-                rationale="[Gemini Suggestion] Minor non-hazardous maintenance request; scheduled in 7-day municipal maintenance cycle.",
+                rationale="[Priority Policy] Minor non-hazardous maintenance request; scheduled in 7-day municipal maintenance cycle.",
                 factors_considered={"urgency": "LOW"}
             )
 
@@ -302,7 +365,7 @@ class GeminiAIProvider(BaseAIProvider):
         return PriorityRecommendation(
             priority=PriorityLevel.P3,
             confidence=0.82,
-            rationale="[Gemini Suggestion] Routine civic issue; assigned standard 72-hour departmental resolution queue.",
+            rationale="[Priority Policy] Routine civic issue; assigned standard 72-hour departmental resolution queue.",
             factors_considered={"urgency": text_result.urgency_level}
         )
 

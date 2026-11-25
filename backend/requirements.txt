@@ -19,13 +19,13 @@ PyYAML==6.0.3
 # Phase A: Rate Limiting
 slowapi==0.1.10
 limits==5.8.0
-redis==8.1.0
+redis==5.3.1
 
-# Phase C: Gemini AI Integration
+# Phase C & Phase 2 Queue / Geo / Object Storage
 google-genai==1.5.0
-
-# Phase D: SMTP Email Delivery
 aiosmtplib==5.1.3
-
-# Media & Storage Processing
 Pillow>=10.4.0
+boto3==1.44.11
+geoalchemy2==0.21.0
+arq==0.28.0
+fakeredis==2.41.0

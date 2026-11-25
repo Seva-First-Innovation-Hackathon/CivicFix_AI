@@ -46,6 +46,16 @@ export const StaffLoginPage: React.FC = () => {
     }
   };
 
+  const demoStaffEmail = import.meta.env.VITE_DEMO_STAFF_EMAIL as string | undefined;
+  const demoStaffPassword = import.meta.env.VITE_DEMO_STAFF_PASSWORD as string | undefined;
+  const demoCrewEmail = import.meta.env.VITE_DEMO_CREW_EMAIL as string | undefined;
+  const demoCrewPassword = import.meta.env.VITE_DEMO_CREW_PASSWORD as string | undefined;
+  const showQuickDemo = Boolean(
+    import.meta.env.DEV &&
+    import.meta.env.VITE_ENABLE_DEMO_LOGIN === 'true' &&
+    ((demoStaffEmail && demoStaffPassword) || (demoCrewEmail && demoCrewPassword))
+  );
+
   const handleQuickDemo = (demoEmail: string, demoPass: string) => {
     setEmail(demoEmail);
     setPassword(demoPass);
@@ -118,49 +128,42 @@ export const StaffLoginPage: React.FC = () => {
             </Button>
           </form>
 
-          {/* Quick Staff Demo Fill */}
-          <div className="pt-4 border-t border-slate-100 space-y-2">
-            <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider block text-center">
-              Municipal Roles Demo Login
-            </span>
-            <div className="grid grid-cols-1 gap-2">
-              <button
-                type="button"
-                onClick={() => handleQuickDemo('admin@civicfix.gov', 'AdminSecure2026!')}
-                className="p-2.5 border border-slate-200 hover:border-ai-400 rounded-xl bg-slate-50 hover:bg-ai-50/50 text-left text-xs transition flex items-center justify-between"
-              >
-                <div>
-                  <div className="font-semibold text-slate-800">1. Government Admin (Highest Privilege)</div>
-                  <div className="text-[10px] text-slate-500">Full municipal control • Single Admin Invariant</div>
-                </div>
-                <ShieldAlert className="w-4 h-4 text-ai-600" />
-              </button>
+          {showQuickDemo && (
+            <div className="pt-4 border-t border-slate-100 space-y-2">
+              <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider block text-center">
+                Local Dev Demo Login
+              </span>
+              <div className="grid grid-cols-1 gap-2">
+                {demoStaffEmail && demoStaffPassword && (
+                  <button
+                    type="button"
+                    onClick={() => handleQuickDemo(demoStaffEmail, demoStaffPassword)}
+                    className="p-2.5 border border-slate-200 hover:border-brand-400 rounded-xl bg-slate-50 hover:bg-brand-50/50 text-left text-xs transition flex items-center justify-between"
+                  >
+                    <div>
+                      <div className="font-semibold text-slate-800">Municipal Member ({demoStaffEmail})</div>
+                      <div className="text-[10px] text-slate-500">Triage review • Dispatch work orders</div>
+                    </div>
+                    <Building2 className="w-4 h-4 text-brand-600" />
+                  </button>
+                )}
 
-              <button
-                type="button"
-                onClick={() => handleQuickDemo('officer.sharma@civicfix.gov', 'StaffSecure2026!')}
-                className="p-2.5 border border-slate-200 hover:border-brand-400 rounded-xl bg-slate-50 hover:bg-brand-50/50 text-left text-xs transition flex items-center justify-between"
-              >
-                <div>
-                  <div className="font-semibold text-slate-800">2. Municipal Member (Roads Officer)</div>
-                  <div className="text-[10px] text-slate-500">Triage review • Dispatch work orders</div>
-                </div>
-                <Building2 className="w-4 h-4 text-brand-600" />
-              </button>
-
-              <button
-                type="button"
-                onClick={() => handleQuickDemo('crew.patel@civicfix.gov', 'CrewSecure2026!')}
-                className="p-2.5 border border-slate-200 hover:border-amber-400 rounded-xl bg-slate-50 hover:bg-amber-50/50 text-left text-xs transition flex items-center justify-between"
-              >
-                <div>
-                  <div className="font-semibold text-slate-800">3. Field Crew (Rapid Road Crew)</div>
-                  <div className="text-[10px] text-slate-500">Execute repairs • Upload after-evidence</div>
-                </div>
-                <Wrench className="w-4 h-4 text-amber-600" />
-              </button>
+                {demoCrewEmail && demoCrewPassword && (
+                  <button
+                    type="button"
+                    onClick={() => handleQuickDemo(demoCrewEmail, demoCrewPassword)}
+                    className="p-2.5 border border-slate-200 hover:border-amber-400 rounded-xl bg-slate-50 hover:bg-amber-50/50 text-left text-xs transition flex items-center justify-between"
+                  >
+                    <div>
+                      <div className="font-semibold text-slate-800">Field Crew ({demoCrewEmail})</div>
+                      <div className="text-[10px] text-slate-500">Execute repairs • Upload after-evidence</div>
+                    </div>
+                    <Wrench className="w-4 h-4 text-amber-600" />
+                  </button>
+                )}
+              </div>
             </div>
-          </div>
+          )}
 
           <div className="text-center pt-2">
             <Link to="/login" className="text-xs text-brand-600 hover:text-brand-700 font-semibold">

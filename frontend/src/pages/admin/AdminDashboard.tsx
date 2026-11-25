@@ -81,7 +81,9 @@ export const AdminDashboard: React.FC = () => {
             <AlertTriangle className="w-4 h-4 text-rose-500" />
           </div>
           <p className="text-2xl font-bold text-rose-600">{m?.overdue_complaints || 0}</p>
-          <span className="text-[11px] text-rose-500 mt-1 block">Escalation required</span>
+          <span className="text-[11px] text-rose-500 mt-1 block">
+            {m?.sla_breach_events_count ?? 0} breach events • {m?.queue_backlog_count ?? 0} queued jobs
+          </span>
         </div>
 
         <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-xs">

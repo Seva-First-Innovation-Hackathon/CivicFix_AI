@@ -10,7 +10,8 @@ def log_audit(
     entity_id: str,
     user_id: Optional[str] = None,
     details: Optional[Any] = None,
-    ip_address: Optional[str] = None
+    ip_address: Optional[str] = None,
+    commit: bool = True,
 ) -> AuditLog:
     """Creates an immutable audit log entry for regulatory and administrative tracking."""
     details_str = None
@@ -32,6 +33,6 @@ def log_audit(
         ip_address=ip_address
     )
     db.add(log_entry)
-    db.commit()
+    if commit:
+        db.commit()
     return log_entry
-

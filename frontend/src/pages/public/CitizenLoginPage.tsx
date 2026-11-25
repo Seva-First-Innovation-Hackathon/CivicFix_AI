@@ -57,6 +57,15 @@ export const CitizenLoginPage: React.FC = () => {
     }
   };
 
+  const demoCitizenEmail = import.meta.env.VITE_DEMO_CITIZEN_EMAIL as string | undefined;
+  const demoCitizenPassword = import.meta.env.VITE_DEMO_CITIZEN_PASSWORD as string | undefined;
+  const showQuickDemo = Boolean(
+    import.meta.env.DEV &&
+    import.meta.env.VITE_ENABLE_DEMO_LOGIN === 'true' &&
+    demoCitizenEmail &&
+    demoCitizenPassword
+  );
+
   const handleQuickDemo = (demoEmail: string, demoPass: string) => {
     setEmail(demoEmail);
     setPassword(demoPass);
@@ -129,30 +138,21 @@ export const CitizenLoginPage: React.FC = () => {
             </Button>
           </form>
 
-          {/* Quick Demo Credentials */}
-          <div className="pt-4 border-t border-slate-100 space-y-2">
-            <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider block text-center">
-              Demonstration Accounts
-            </span>
-            <div className="grid grid-cols-2 gap-2">
+          {showQuickDemo && demoCitizenEmail && demoCitizenPassword && (
+            <div className="pt-4 border-t border-slate-100 space-y-2">
+              <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider block text-center">
+                Local Dev Demo Account
+              </span>
               <button
                 type="button"
-                onClick={() => handleQuickDemo('citizen.arjun@example.com', 'CitizenPass2026!')}
-                className="p-2 border border-slate-200 hover:border-brand-300 rounded-xl bg-slate-50 hover:bg-brand-50/50 text-left text-xs transition"
+                onClick={() => handleQuickDemo(demoCitizenEmail, demoCitizenPassword)}
+                className="w-full p-2 border border-slate-200 hover:border-brand-300 rounded-xl bg-slate-50 hover:bg-brand-50/50 text-left text-xs transition"
               >
-                <div className="font-semibold text-slate-800">Arjun Reddy</div>
-                <div className="text-[10px] text-slate-500">Active reports</div>
-              </button>
-              <button
-                type="button"
-                onClick={() => handleQuickDemo('citizen.priya@example.com', 'CitizenPass2026!')}
-                className="p-2 border border-slate-200 hover:border-brand-300 rounded-xl bg-slate-50 hover:bg-brand-50/50 text-left text-xs transition"
-              >
-                <div className="font-semibold text-slate-800">Priya Nair</div>
-                <div className="text-[10px] text-slate-500">Verified reports</div>
+                <div className="font-semibold text-slate-800">{demoCitizenEmail}</div>
+                <div className="text-[10px] text-slate-500">Fill configured local demo citizen</div>
               </button>
             </div>
-          </div>
+          )}
 
           <div className="text-center pt-2 space-y-2">
             <p className="text-xs text-slate-600">

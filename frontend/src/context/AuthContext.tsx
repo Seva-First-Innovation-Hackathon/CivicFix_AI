@@ -32,17 +32,37 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         try {
           const freshUser = await authService.getCurrentUser();
           setUser(freshUser);
+          setToken(localStorage.getItem('civicfix_token'));
           localStorage.setItem('civicfix_user', JSON.stringify(freshUser));
         } catch {
           setUser(null);
           setToken(null);
           localStorage.removeItem('civicfix_token');
+          localStorage.removeItem('civicfix_refresh_token');
           localStorage.removeItem('civicfix_user');
         }
       }
       setIsLoading(false);
     };
     initAuth();
+
+    const handleTokenRefreshed = (evt: Event) => {
+      const customEvt = evt as CustomEvent<{ token?: string }>;
+      if (customEvt.detail?.token) {
+        setToken(customEvt.detail.token);
+      }
+    };
+    const handleAuthExpired = () => {
+      setToken(null);
+      setUser(null);
+    };
+
+    window.addEventListener('civicfix:token-refreshed', handleTokenRefreshed);
+    window.addEventListener('civicfix:auth-expired', handleAuthExpired);
+    return () => {
+      window.removeEventListener('civicfix:token-refreshed', handleTokenRefreshed);
+      window.removeEventListener('civicfix:auth-expired', handleAuthExpired);
+    };
   }, []);
 
   const login = (newToken: string, newUser: User, refreshToken?: string) => {

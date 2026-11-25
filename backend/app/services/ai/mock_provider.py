@@ -1,11 +1,14 @@
+from io import BytesIO
 import re
 from typing import Optional, List, Dict, Any
+from PIL import Image, ImageStat
 from app.models.enums import ComplaintCategory, PriorityLevel
 from app.services.ai.base import (
     BaseAIProvider,
     TextAnalysisResult,
     ImageAnalysisResult,
-    PriorityRecommendation
+    PriorityRecommendation,
+    RepairComparisonResult,
 )
 
 class MockAIProvider(BaseAIProvider):
@@ -31,7 +34,7 @@ class MockAIProvider(BaseAIProvider):
             category = ComplaintCategory.ROADS
             subcategory = "Road Surface Damage & Potholes"
             keywords.extend(["pothole", "road maintenance"])
-        elif any(w in combined for w in ["light", "lamp", "dark", "pole", "wire", "bulb", "streetlight"]):
+        elif any(w in combined for w in ["light", "lamp", "dark", "pole", "wire", "bulb", "streetlight", "electrical", "transformer", "substation"]):
             category = ComplaintCategory.STREETLIGHTS
             subcategory = "Non-functional Luminaire / Broken Pole"
             keywords.extend(["streetlight", "public illumination"])
@@ -89,9 +92,27 @@ class MockAIProvider(BaseAIProvider):
             extracted_keywords=keywords
         )
 
-    async def analyze_image(self, file_path: str) -> ImageAnalysisResult:
+    async def analyze_image(
+        self,
+        file_path: str,
+        image_bytes: Optional[bytes] = None,
+    ) -> ImageAnalysisResult:
         # Deterministic analysis for mock provider
-        file_lower = file_path.lower()
+        file_lower = (file_path or "").lower()
+        suggested_cat: Optional[ComplaintCategory] = None
+        if any(w in file_lower for w in ["pothole", "asphalt", "road"]):
+            suggested_cat = ComplaintCategory.ROADS
+        elif any(w in file_lower for w in ["streetlight", "lamp", "light_pole"]):
+            suggested_cat = ComplaintCategory.STREETLIGHTS
+        elif any(w in file_lower for w in ["garbage", "trash", "dump"]):
+            suggested_cat = ComplaintCategory.GARBAGE
+        elif any(w in file_lower for w in ["drain", "flood", "sewage", "waterlog"]):
+            suggested_cat = ComplaintCategory.DRAINAGE
+        elif any(w in file_lower for w in ["pipeline", "water_leak", "pipe"]):
+            suggested_cat = ComplaintCategory.WATER_SUPPLY
+        elif any(w in file_lower for w in ["tree", "fallen_branch"]):
+            suggested_cat = ComplaintCategory.TREES_HAZARDS
+
         if "resolution" in file_lower or "after" in file_lower:
             return ImageAnalysisResult(
                 damage_detected=False,
@@ -103,12 +124,17 @@ class MockAIProvider(BaseAIProvider):
                     "No residual debris or obstruction observed",
                     "Clear vehicular/pedestrian clearance confirmed"
                 ],
-                is_inconclusive=False
+                is_inconclusive=False,
+                suggested_category=suggested_cat,
             )
-        
+
         return ImageAnalysisResult(
             damage_detected=True,
-            damage_type="Civic Infrastructure Defect",
+            damage_type=(
+                f"Suspected {suggested_cat.value.replace('_', ' ').title()} Defect"
+                if suggested_cat
+                else "Civic Infrastructure Defect"
+            ),
             damage_severity="HIGH",
             confidence_score=0.87,
             observations=[
@@ -116,7 +142,58 @@ class MockAIProvider(BaseAIProvider):
                 "Hazard footprint extends into public thoroughfare",
                 "Photographic evidence matches reported complaint parameters"
             ],
-            is_inconclusive=False
+            is_inconclusive=False,
+            suggested_category=suggested_cat,
+        )
+
+    async def compare_before_after_images(
+        self,
+        before_bytes: bytes,
+        after_bytes: bytes,
+        context_title: str = "",
+    ) -> RepairComparisonResult:
+        """
+        Performs deterministic Pillow structural pixel/luminance comparison without
+        fabricating an arbitrary repair confidence metric. Always requires human sign-off.
+        """
+        img_before = Image.open(BytesIO(before_bytes)).convert("RGB")
+        img_after = Image.open(BytesIO(after_bytes)).convert("RGB")
+
+        size_before = img_before.size
+        size_after = img_after.size
+
+        small_b = img_before.resize((64, 64)).convert("L")
+        small_a = img_after.resize((64, 64)).convert("L")
+        pixels_b = list(small_b.getdata())
+        pixels_a = list(small_a.getdata())
+        mean_abs_delta = sum(abs(a - b) for a, b in zip(pixels_a, pixels_b)) / max(1, len(pixels_a))
+        mean_lum_b = ImageStat.Stat(small_b).mean[0]
+        mean_lum_a = ImageStat.Stat(small_a).mean[0]
+        lum_shift = mean_lum_a - mean_lum_b
+
+        changes_detected = mean_abs_delta >= 5.0
+        differences = [
+            f"Normalized 64x64 pixel luminance delta: {mean_abs_delta:.1f}/255 ({'material visual change' if changes_detected else 'minimal visual difference detected'}).",
+            f"Average scene brightness shifted by {lum_shift:+.1f} levels between submitted images.",
+            f"Image resolutions compared: before {size_before[0]}x{size_before[1]}px vs after {size_after[0]}x{size_after[1]}px.",
+        ]
+        summary = (
+            f"Automated visual diff observed measurable structural/surface differences across before/after photographs for '{context_title or 'complaint'}'."
+            if changes_detected
+            else "Images appear visually similar at coarse grayscale inspection; verify camera angle and repair completion directly."
+        )
+        uncertainty = (
+            "Advisory comparison only: camera framing, time-of-day lighting, shadows, and lens distance can cause "
+            "high pixel differences unrelated to actual repair quality. Municipal staff inspection is mandatory."
+        )
+        return RepairComparisonResult(
+            changes_detected=changes_detected,
+            visual_differences=differences,
+            summary=summary,
+            uncertainty_notes=uncertainty,
+            provider=self.provider_name,
+            model_name=self.model_name,
+            requires_human_review=True,
         )
 
     async def transcribe_audio(self, file_path: str, language: str = "en") -> str:

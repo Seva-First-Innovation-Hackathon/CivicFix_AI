@@ -12,6 +12,9 @@ class AttachmentResponse(BaseModel):
     attachment_type: str
     is_internal: bool = False
     description: Optional[str] = None
+    storage_provider: str = "local"
+    sha256_checksum: Optional[str] = None
+    storage_verification_status: str = "VERIFIED"
     uploaded_by_id: str
     created_at: datetime
 
@@ -44,10 +47,35 @@ class AIAnalysisResponse(BaseModel):
     urgency_level: str
     summary_explanation: str
     visual_findings: Optional[str] = None
+    image_suggested_category: Optional[str] = None
+    cross_modal_mismatch: bool = False
+    cross_modal_explanation: Optional[str] = None
+    routing_tier: str = "MEDIUM_CONFIDENCE"
+    recommended_action: str = "REQUIRE_VERIFICATION"
+    suggested_department_id: Optional[str] = None
     duplicate_checked: bool
     is_overridden: bool
     override_reason: Optional[str] = None
+    override_timestamp: Optional[datetime] = None
     created_at: datetime
+
+
+class ResolutionComparisonResponse(BaseModel):
+    id: str
+    complaint_id: str
+    before_attachment_id: str
+    after_attachment_id: str
+    provider: str
+    model_name: str
+    changes_detected: bool
+    visual_differences_json: str
+    summary: str
+    uncertainty_notes: str
+    requires_human_review: bool = True
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
 
     class Config:
         from_attributes = True
@@ -129,6 +157,12 @@ class ComplaintResponse(BaseModel):
     assigned_crew_name: Optional[str] = None
     is_disputed: bool
     sla_deadline: Optional[datetime] = None
+    is_overdue: bool = False
+    hours_overdue: Optional[float] = None
+    ai_processing_status: str = "PENDING"
+    ai_processing_error: Optional[str] = None
+    ai_processing_attempts: int = 0
+    ai_processing_completed_at: Optional[datetime] = None
     cancellation_reason: Optional[str] = None
     rejection_reason: Optional[str] = None
     investigation_notes: Optional[str] = None
@@ -144,6 +178,7 @@ class ComplaintResponse(BaseModel):
     resolution_submissions: List[ResolutionSubmissionResponse] = []
     resolution_verifications: List[ResolutionVerificationResponse] = []
     comments: List[ComplaintCommentResponse] = []
+    resolution_comparisons: List[ResolutionComparisonResponse] = []
 
     class Config:
         from_attributes = True
@@ -167,7 +202,14 @@ class ComplaintAssignmentRequest(BaseModel):
 class AIOverrideRequest(BaseModel):
     category: Optional[ComplaintCategory] = None
     priority: Optional[PriorityLevel] = None
+    department_id: Optional[str] = None
+    image_assessment_override: Optional[str] = Field(None, max_length=1000)
     override_reason: str = Field(..., min_length=5)
+
+
+class CompareEvidenceRequest(BaseModel):
+    before_attachment_id: Optional[str] = None
+    after_attachment_id: Optional[str] = None
 
 class ResolutionSubmitRequest(BaseModel):
     resolution_notes: str = Field(..., min_length=10)

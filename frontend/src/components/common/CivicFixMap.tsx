@@ -1,5 +1,5 @@
 import React, { useEffect, useState, Component, type ReactNode, useMemo } from 'react';
-import { MapContainer, TileLayer, Marker, Popup, useMap, useMapEvents } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, Circle, useMap, useMapEvents } from 'react-leaflet';
 import L from 'leaflet';
 import { useNavigate } from 'react-router-dom';
 import { 
@@ -54,6 +54,18 @@ export interface MapWorkOrderItem {
   complaint_longitude?: number;
 }
 
+export interface MapHotspotItem {
+  bucket_lat: number;
+  bucket_lon: number;
+  complaint_count: number;
+  open_count: number;
+  p1_count: number;
+  overdue_count: number;
+  dominant_category: string;
+  intensity: number;
+  radius_meters: number;
+}
+
 export interface CivicFixMapProps {
   mode?: 'picker' | 'viewer' | 'crew';
   center?: [number, number];
@@ -66,6 +78,9 @@ export interface CivicFixMapProps {
   disabled?: boolean;
   // Viewer props
   complaints?: MapComplaintItem[];
+  hotspots?: MapHotspotItem[];
+  showHotspots?: boolean;
+  showMarkers?: boolean;
   onSelectComplaint?: (id: string) => void;
   // Crew props
   workOrders?: MapWorkOrderItem[];
@@ -299,6 +314,9 @@ export const CivicFixMap: React.FC<CivicFixMapProps> = ({
   onLocationChange,
   disabled = false,
   complaints = [],
+  hotspots = [],
+  showHotspots = false,
+  showMarkers = true,
   onSelectComplaint,
   workOrders = [],
   onSelectWorkOrder,
@@ -497,7 +515,44 @@ export const CivicFixMap: React.FC<CivicFixMapProps> = ({
             {mode === 'viewer' && (
               <>
                 <FitBoundsUpdater points={viewerPoints} />
-                {complaints.map((c) => {
+                {showHotspots && hotspots.map((hs, idx) => {
+                  if (!validateCoordinates(hs.bucket_lat, hs.bucket_lon)) return null;
+                  const fillColor =
+                    hs.p1_count > 0 || hs.intensity >= 0.7
+                      ? '#ef4444'
+                      : hs.intensity >= 0.4
+                        ? '#f97316'
+                        : '#3b82f6';
+                  return (
+                    <Circle
+                      key={`hotspot-${idx}-${hs.bucket_lat}-${hs.bucket_lon}`}
+                      center={[hs.bucket_lat, hs.bucket_lon]}
+                      radius={hs.radius_meters || 450}
+                      pathOptions={{
+                        color: fillColor,
+                        fillColor,
+                        fillOpacity: 0.25 + 0.3 * hs.intensity,
+                        weight: 1.5,
+                      }}
+                    >
+                      <Popup className="civicfix-dark-popup">
+                        <div className="p-2.5 text-xs text-slate-100 font-sans min-w-[190px]">
+                          <div className="font-bold text-amber-300 mb-1">
+                            Spatial Hotspot Cluster
+                          </div>
+                          <div className="space-y-0.5 text-[11px] text-slate-300">
+                            <div>Total Reports: <strong>{hs.complaint_count}</strong></div>
+                            <div>Open Issues: <strong>{hs.open_count}</strong></div>
+                            <div>Critical (P1): <strong className="text-rose-400">{hs.p1_count}</strong></div>
+                            <div>SLA Overdue: <strong className="text-amber-300">{hs.overdue_count}</strong></div>
+                            <div>Dominant Type: <strong>{hs.dominant_category}</strong></div>
+                          </div>
+                        </div>
+                      </Popup>
+                    </Circle>
+                  );
+                })}
+                {showMarkers && complaints.map((c) => {
                   if (!validateCoordinates(c.latitude, c.longitude)) return null;
                   const markerIcon = createCivicMarkerIcon(c.priority, c.status, false);
 

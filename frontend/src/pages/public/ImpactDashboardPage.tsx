@@ -85,7 +85,7 @@ export const ImpactDashboardPage: React.FC = () => {
             <Clock className="w-5 h-5 text-ai-600" />
           </div>
           <p className="text-3xl font-extrabold text-slate-900">
-            {data ? `${data.average_resolution_hours}h` : '0h'}
+            {data && data.average_resolution_hours !== null ? `${data.average_resolution_hours}h` : 'N/A'}
           </p>
           <span className="text-xs text-slate-500 mt-1 block">Submission to verified repair</span>
         </div>

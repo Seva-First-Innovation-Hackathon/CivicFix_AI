@@ -32,28 +32,41 @@ def get_client_ip(request: Request) -> str:
         return request.client.host
     return "127.0.0.1"
 
+RATE_LIMITER_MODE = "memory_dev"
+
+
 def create_limiter() -> Limiter:
     """
     Initializes Limiter with configured storage backend (Redis in production, Memory locally).
-    Fails safely: if production Redis is unreachable, falls back to in-memory to ensure
-    protection is never silently disabled.
+    Fails safely while explicitly tracking degraded fallback status so production probes
+    never silently report memory:// fallback as healthy Redis.
     """
-    storage_uri = settings.RATE_LIMIT_STORAGE_URL
-    
+    global RATE_LIMITER_MODE
+    storage_uri = settings.RATE_LIMIT_STORAGE_URL or "memory://"
+    is_prod = settings.ENVIRONMENT.lower() == "production"
+
     if storage_uri.startswith("redis://") or storage_uri.startswith("rediss://"):
         try:
             import redis
-            # Quick connectivity verification
             r = redis.from_url(storage_uri, socket_connect_timeout=2)
             r.ping()
-            logger.info("Rate limiter successfully connected to Redis storage: %s", storage_uri)
+            RATE_LIMITER_MODE = "redis"
+            logger.info("Rate limiter connected to Redis storage backend.")
         except Exception as exc:
-            logger.warning(
-                "Configured Redis storage (%s) is unavailable: %s. "
-                "Failing safely by falling back to 'memory://' so rate limiting remains ACTIVE.",
-                storage_uri, exc
+            RATE_LIMITER_MODE = "memory_degraded_fallback"
+            logger.error(
+                "Configured Redis rate-limit storage is unavailable (%s). "
+                "Falling back to in-process memory:// so rate limiting remains active (DEGRADED).",
+                type(exc).__name__,
             )
             storage_uri = "memory://"
+    elif is_prod:
+        RATE_LIMITER_MODE = "memory_unconfigured_prod"
+        logger.warning(
+            "Production rate limiter is running with non-distributed memory:// backend; configure REDIS_URL."
+        )
+    else:
+        RATE_LIMITER_MODE = "memory_dev"
 
     return Limiter(
         key_func=get_client_ip,

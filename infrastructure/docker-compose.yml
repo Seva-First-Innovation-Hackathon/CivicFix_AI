@@ -7,14 +7,26 @@ services:
     restart: always
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-civicfix_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-CivicFixPostgres2026!}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be configured in .env}
       POSTGRES_DB: ${POSTGRES_DB:-civicfix_db}
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U civicfix_user -d civicfix_db"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-civicfix_user} -d $${POSTGRES_DB:-civicfix_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: civicfix-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -28,14 +40,78 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://civicfix_user:CivicFixPostgres2026!@db:5432/civicfix_db
-      SECRET_KEY: ${SECRET_KEY:-civicfix-production-secret-key-min-32-chars-long-2026}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-civicfix_user}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be configured in .env}@db:5432/${POSTGRES_DB:-civicfix_db}
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be configured in .env}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
+      R2_BUCKET_NAME: ${R2_BUCKET_NAME:-}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+      R2_ENDPOINT_URL: ${R2_ENDPOINT_URL:-}
+      R2_REGION: ${R2_REGION:-auto}
+      REQUIRE_DURABLE_STORAGE: ${REQUIRE_DURABLE_STORAGE:-false}
+      QUEUE_BACKEND: ${QUEUE_BACKEND:-redis}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REQUIRE_REDIS: ${REQUIRE_REDIS:-false}
       AI_PROVIDER: ${AI_PROVIDER:-mock}
-      INITIAL_ADMIN_EMAIL: ${INITIAL_ADMIN_EMAIL:-admin@civicfix.gov}
-      INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD:-AdminSecure2026!}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      EMAIL_ENABLED: ${EMAIL_ENABLED:-false}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-noreply@civicfix.gov}
+      INITIAL_ADMIN_EMAIL: ${INITIAL_ADMIN_EMAIL:-}
+      INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD:-}
+      ALLOW_DEMO_SEEDING: ${ALLOW_DEMO_SEEDING:-false}
     ports:
       - "8000:8000"
+    volumes:
+      - uploads_data:/app/uploads
+
+  worker:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: civicfix-worker
+    restart: always
+    command: ["python", "worker.py"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-civicfix_user}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be configured in .env}@db:5432/${POSTGRES_DB:-civicfix_db}
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be configured in .env}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
+      R2_BUCKET_NAME: ${R2_BUCKET_NAME:-}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+      R2_ENDPOINT_URL: ${R2_ENDPOINT_URL:-}
+      R2_REGION: ${R2_REGION:-auto}
+      REQUIRE_DURABLE_STORAGE: ${REQUIRE_DURABLE_STORAGE:-false}
+      QUEUE_BACKEND: redis
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      REQUIRE_REDIS: ${REQUIRE_REDIS:-false}
+      AI_PROVIDER: ${AI_PROVIDER:-mock}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      EMAIL_ENABLED: ${EMAIL_ENABLED:-false}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-noreply@civicfix.gov}
     volumes:
       - uploads_data:/app/uploads
 
@@ -53,4 +129,3 @@ services:
 volumes:
   pgdata:
   uploads_data:
-

@@ -84,6 +84,9 @@ export interface Attachment {
   attachment_type: string;
   is_internal?: boolean;
   description?: string;
+  storage_provider?: string;
+  sha256_checksum?: string;
+  storage_verification_status?: string;
   uploaded_by_id: string;
   created_at: string;
 }
@@ -112,9 +115,31 @@ export interface AIAnalysis {
   urgency_level: string;
   summary_explanation: string;
   visual_findings?: string;
+  image_suggested_category?: string | null;
+  cross_modal_mismatch?: boolean;
+  cross_modal_explanation?: string | null;
+  routing_tier?: string;
+  recommended_action?: string;
+  suggested_department_id?: string | null;
   duplicate_checked: boolean;
   is_overridden: boolean;
   override_reason?: string;
+  override_timestamp?: string;
+  created_at: string;
+}
+
+export interface ResolutionComparison {
+  id: string;
+  complaint_id: string;
+  before_attachment_id: string;
+  after_attachment_id: string;
+  provider: string;
+  model_name: string;
+  changes_detected: boolean;
+  visual_differences_json: string;
+  summary: string;
+  uncertainty_notes: string;
+  requires_human_review: boolean;
   created_at: string;
 }
 
@@ -190,6 +215,12 @@ export interface Complaint {
   assigned_crew_name?: string;
   is_disputed: boolean;
   sla_deadline?: string;
+  is_overdue?: boolean;
+  hours_overdue?: number | null;
+  ai_processing_status?: string;
+  ai_processing_error?: string | null;
+  ai_processing_attempts?: number;
+  ai_processing_completed_at?: string | null;
   cancellation_reason?: string;
   rejection_reason?: string;
   investigation_notes?: string;
@@ -203,6 +234,7 @@ export interface Complaint {
   resolution_submissions: ResolutionSubmission[];
   resolution_verifications: ResolutionVerification[];
   comments?: ComplaintComment[];
+  resolution_comparisons?: ResolutionComparison[];
 }
 
 export interface Department {
@@ -256,13 +288,58 @@ export interface AnalyticsOverview {
     reopened_complaints: number;
     high_priority_unresolved: number;
     overdue_complaints: number;
+    sla_breach_events_count?: number;
+    queue_backlog_count?: number;
     average_resolution_hours: number;
     citizen_satisfaction_rate: number;
   };
   by_category: Array<{ category: string; count: number; percentage: number }>;
   by_priority: Array<{ priority: string; count: number; percentage: number }>;
-  by_department: Array<{ department_name: string; count: number; resolved_count: number }>;
+  by_department: Array<{ department_name: string; count: number; resolved_count: number; open_count?: number }>;
   trends: Array<{ date: string; submitted: number; resolved: number }>;
+}
+
+export interface HotspotCluster {
+  bucket_lat: number;
+  bucket_lon: number;
+  complaint_count: number;
+  open_count: number;
+  p1_count: number;
+  overdue_count: number;
+  dominant_category: string;
+  intensity: number;
+  radius_meters: number;
+}
+
+export interface HotspotResponse {
+  hotspots: HotspotCluster[];
+  total_complaints_matched: number;
+  grid_size_meters: number;
+  aggregation_method: string;
+  is_demonstration_mode: boolean;
+}
+
+export interface AIEvaluationSummary {
+  total_analyzed: number;
+  provider_distribution: Record<string, number>;
+  staff_override_count: number;
+  staff_override_rate_percent: number;
+  cross_modal_disagreement_count: number;
+  failed_analysis_count: number;
+  processing_status_counts: Record<string, number>;
+  confidence_tiers: Record<string, number>;
+  evaluation_note: string;
+  recent_feedback: Array<{
+    id: string;
+    complaint_id: string;
+    reviewer_name: string;
+    original_category?: string;
+    corrected_category?: string;
+    original_priority?: string;
+    corrected_priority?: string;
+    reason: string;
+    created_at: string;
+  }>;
 }
 
 export interface PublicImpactData {
@@ -270,7 +347,7 @@ export interface PublicImpactData {
   complaints_resolved: number;
   complaints_in_progress: number;
   resolution_success_rate: number;
-  average_resolution_hours: number;
+  average_resolution_hours: number | null;
   top_categories: Array<{ category: string; count: number }>;
   is_demonstration_mode: boolean;
 }
