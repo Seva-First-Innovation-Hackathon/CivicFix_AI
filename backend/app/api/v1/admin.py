@@ -42,7 +42,17 @@ from app.core.security import get_password_hash
 from app.services.audit import log_audit
 from app.services.notifications.service import send_notification
 from app.services.email.service import email_service
-from app.services.complaints.lifecycle import execute_transition, enforce_complaint_department_scope, enforce_complaint_staff_access
+from app.services.complaints.lifecycle import (
+    ALLOWED_WORK_ORDER_PATCH_TRANSITIONS,
+    ELIGIBLE_ASSIGNMENT_STATUSES,
+    ELIGIBLE_WORK_ORDER_COMPLAINT_STATUSES,
+    INELIGIBLE_ACTIVE_WO_COMPLAINT_STATUSES,
+    enforce_complaint_department_scope,
+    enforce_complaint_staff_access,
+    enforce_department_dispatch_scope,
+    enforce_work_order_actor_access,
+    execute_transition,
+)
 
 router = APIRouter(prefix="/admin", tags=["Municipal Administration"])
 
@@ -474,6 +484,29 @@ def review_completion_evidence(
         notes=data.notes,
         background_tasks=background_tasks
     )
+
+    pending_wos = (
+        db.query(WorkOrder)
+        .filter(
+            WorkOrder.complaint_id == complaint.id,
+            WorkOrder.status == WorkOrderStatus.WORK_COMPLETED_PENDING_REVIEW.value,
+        )
+        .all()
+    )
+    if pending_wos:
+        now_review = datetime.now(timezone.utc)
+        for wo in pending_wos:
+            if data.is_approved:
+                wo.status = WorkOrderStatus.COMPLETED.value
+                wo.completion_date = wo.completion_date or now_review
+            else:
+                wo.status = WorkOrderStatus.IN_PROGRESS.value
+                wo.updated_at = now_review
+                if wo.crew and wo.crew.crew_profile:
+                    wo.crew.crew_profile.active_task_count += 1
+        db.commit()
+        db.refresh(complaint)
+
     return complaint
 
 @router.post("/complaints/{complaint_id}/internal-note", response_model=ComplaintCommentResponse)
@@ -529,9 +562,29 @@ def assign_complaint(
 
     enforce_complaint_department_scope(current_user, complaint)
 
+    if complaint.status not in ELIGIBLE_ASSIGNMENT_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot assign complaint while in '{complaint.status}' status"
+        )
+
     dept = db.query(MunicipalDepartment).filter(MunicipalDepartment.id == data.department_id).first()
     if not dept:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department not found")
+
+    enforce_department_dispatch_scope(
+        current_user,
+        complaint,
+        dept,
+        require_complaint_dept_match=False,
+    )
+
+    if (
+        complaint.assigned_crew
+        and complaint.assigned_crew.crew_profile
+        and complaint.assigned_crew.crew_profile.department_id != dept.id
+    ):
+        complaint.assigned_crew_id = None
 
     old_status = complaint.status
     complaint.department_id = dept.id
@@ -751,18 +804,30 @@ def submit_resolution(
     complaint_id: str,
     data: ResolutionSubmitRequest,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(require_any_staff),
+    current_user: User = Depends(require_municipal_staff),
     db: Session = Depends(get_db)
 ):
     """
-    Stage 1 Verification: Field crew or staff submits completion details and repair notes.
+    Stage 1 Verification: Authorized municipal staff submits completion details and repair notes.
     Transitions complaint to AWAITING_CITIZEN_CONFIRMATION and alerts the citizen.
+    (Field crews submit repair evidence via /work-orders/{id}/submit-evidence for staff verification.)
     """
     complaint = db.query(Complaint).filter(Complaint.id == complaint_id).first()
     if not complaint:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Complaint not found")
 
     enforce_complaint_staff_access(db, current_user, complaint)
+
+    if complaint.status in {
+        ComplaintStatus.RESOLVED.value,
+        ComplaintStatus.CANCELLED.value,
+        ComplaintStatus.REJECTED.value,
+        ComplaintStatus.AWAITING_CITIZEN_CONFIRMATION.value,
+    }:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot submit resolution while complaint is in '{complaint.status}' status"
+        )
 
     resolution = ResolutionSubmission(
         complaint_id=complaint.id,
@@ -891,6 +956,11 @@ def get_map_complaints(
     complaints = query.all()
     features = []
     for c in complaints:
+        visible_atts = (
+            [a for a in c.attachments if not a.is_internal]
+            if current_user.role == UserRole.CITIZEN.value
+            else list(c.attachments)
+        )
         features.append({
             "id": c.id,
             "reference_number": c.reference_number,
@@ -902,8 +972,8 @@ def get_map_complaints(
             "longitude": c.longitude,
             "address": c.address,
             "created_at": c.created_at.isoformat(),
-            "has_attachments": len(c.attachments) > 0,
-            "first_image": c.attachments[0].file_path if c.attachments else None
+            "has_attachments": len(visible_atts) > 0,
+            "first_attachment_id": visible_atts[0].id if visible_atts else None,
         })
     return {"complaints": features}
 
@@ -1027,6 +1097,28 @@ def list_users(
     if role:
         query = query.filter(User.role == role)
     return query.order_by(User.created_at.desc()).all()
+
+@router.get("/crews", response_model=List[UserResponse])
+def list_field_crews(
+    current_user: User = Depends(require_municipal_staff),
+    db: Session = Depends(get_db)
+):
+    """
+    Municipal officers and government admins list active field crew accounts.
+    Municipal officers only receive crews registered in their own department.
+    """
+    query = db.query(User).filter(
+        User.role == UserRole.FIELD_CREW.value,
+        User.is_active == True,
+    )
+    if current_user.role == UserRole.MUNICIPAL_MEMBER.value:
+        membership = current_user.department_membership
+        if not membership or not membership.department_id:
+            return []
+        query = query.join(CrewProfile, CrewProfile.user_id == User.id).filter(
+            CrewProfile.department_id == membership.department_id
+        )
+    return query.order_by(User.full_name.asc()).all()
 
 @router.post("/users/{user_id}/deactivate")
 def deactivate_user(
@@ -1200,6 +1292,11 @@ def get_work_orders(
 
     if current_user.role == UserRole.FIELD_CREW.value:
         query = query.filter(WorkOrder.crew_id == current_user.id)
+    elif current_user.role == UserRole.MUNICIPAL_MEMBER.value:
+        membership = current_user.department_membership
+        if not membership or not membership.department_id:
+            return []
+        query = query.filter(WorkOrder.department_id == membership.department_id)
 
     if status:
         query = query.filter(WorkOrder.status == status)
@@ -1241,20 +1338,34 @@ def create_work_order(
     current_user: User = Depends(require_municipal_staff),
     db: Session = Depends(get_db)
 ):
-    """Staff dispatches work order to an authorized field crew."""
+    """Staff dispatches work order to an authorized same-department active field crew."""
     complaint = db.query(Complaint).filter(Complaint.id == data.complaint_id).first()
     if not complaint:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Complaint not found")
 
     enforce_complaint_department_scope(current_user, complaint)
 
-    crew = db.query(User).filter(User.id == data.crew_id, User.role == UserRole.FIELD_CREW.value).first()
-    if not crew:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Field crew member not found")
+    if complaint.status not in ELIGIBLE_WORK_ORDER_COMPLAINT_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot dispatch work order while complaint is in '{complaint.status}' status"
+        )
 
     dept = db.query(MunicipalDepartment).filter(MunicipalDepartment.id == data.department_id).first()
     if not dept:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department not found")
+
+    crew = db.query(User).filter(User.id == data.crew_id).first()
+    if not crew:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Field crew member not found")
+
+    enforce_department_dispatch_scope(
+        current_user,
+        complaint,
+        dept,
+        crew=crew,
+        require_complaint_dept_match=True,
+    )
 
     wo = WorkOrder(
         complaint_id=complaint.id,
@@ -1268,15 +1379,16 @@ def create_work_order(
     db.add(wo)
     db.flush()
 
-    # Link crew to complaint and capture real prior status before update
+    # Link crew and department to complaint cleanly
     old_status = complaint.status
     complaint.assigned_crew_id = crew.id
-    if not complaint.department_id:
-        complaint.department_id = dept.id
+    complaint.department_id = dept.id
     complaint.status = ComplaintStatus.IN_PROGRESS.value
 
-    if crew.crew_profile:
-        crew.crew_profile.active_task_count += 1
+    db.query(CrewProfile).filter(CrewProfile.user_id == crew.id).update(
+        {CrewProfile.active_task_count: CrewProfile.active_task_count + 1},
+        synchronize_session=False,
+    )
 
     history = ComplaintStatusHistory(
         complaint_id=complaint.id,
@@ -1304,7 +1416,7 @@ def create_work_order(
         entity_type="WORK_ORDER",
         entity_id=wo.id,
         user_id=current_user.id,
-        details={"crew_id": crew.id, "complaint_id": complaint.id},
+        details={"crew_id": crew.id, "department_id": dept.id, "complaint_id": complaint.id},
         commit=False,
     )
 
@@ -1342,23 +1454,56 @@ def update_work_order_status(
     current_user: User = Depends(require_any_staff),
     db: Session = Depends(get_db)
 ):
-    """Field crew updates work order progress or reports blockers."""
+    """Field crew or authorized staff updates in-flight work order progress or reports blockers."""
     wo = db.query(WorkOrder).filter(WorkOrder.id == work_order_id).first()
     if not wo:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Work order not found")
 
-    if current_user.role == UserRole.FIELD_CREW.value and wo.crew_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You can only update your assigned work orders")
-    if current_user.role == UserRole.MUNICIPAL_MEMBER.value and wo.complaint:
-        enforce_complaint_department_scope(current_user, wo.complaint)
+    complaint = enforce_work_order_actor_access(current_user, wo)
 
-    wo.status = data.status.value
+    if complaint.status in INELIGIBLE_ACTIVE_WO_COMPLAINT_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot update work order while complaint is in '{complaint.status}' status"
+        )
+
+    if data.status in {WorkOrderStatus.COMPLETED, WorkOrderStatus.WORK_COMPLETED_PENDING_REVIEW}:
+        if current_user.role == UserRole.FIELD_CREW.value:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Field crews cannot mark work orders completed directly. Submit evidence via /submit-evidence."
+            )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Work order completion must go through evidence submission and review."
+        )
+
+    allowed_next = ALLOWED_WORK_ORDER_PATCH_TRANSITIONS.get(wo.status, set())
+    if data.status.value not in allowed_next:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot transition work order from '{wo.status}' to '{data.status.value}'"
+        )
+
+    now_ts = datetime.now(timezone.utc)
+    update_fields = {
+        WorkOrder.status: data.status.value,
+        WorkOrder.updated_at: now_ts,
+    }
     if data.blocker_reason:
-        wo.blocker_reason = data.blocker_reason
-    if data.status == WorkOrderStatus.COMPLETED:
-        wo.completion_date = datetime.now(timezone.utc)
-        if wo.crew and wo.crew.crew_profile:
-            wo.crew.crew_profile.active_task_count = max(0, wo.crew.crew_profile.active_task_count - 1)
+        update_fields[WorkOrder.blocker_reason] = data.blocker_reason
+
+    updated = (
+        db.query(WorkOrder)
+        .filter(WorkOrder.id == wo.id, WorkOrder.status == wo.status)
+        .update(update_fields, synchronize_session=False)
+    )
+    if updated != 1:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Work order status changed concurrently; please refresh and retry",
+        )
 
     update_entry = WorkOrderUpdate(
         work_order_id=wo.id,
@@ -1374,7 +1519,8 @@ def update_work_order_status(
         entity_type="WORK_ORDER",
         entity_id=wo.id,
         user_id=current_user.id,
-        details={"new_status": data.status.value, "note": data.note}
+        details={"new_status": data.status.value, "note": data.note},
+        commit=False,
     )
 
     db.commit()
@@ -1416,13 +1562,29 @@ def accept_work_order(
     if not wo:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Work order not found")
 
-    if current_user.role == UserRole.FIELD_CREW.value and wo.crew_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied: Work order not assigned to you")
-    if current_user.role == UserRole.MUNICIPAL_MEMBER.value and wo.complaint:
-        enforce_complaint_department_scope(current_user, wo.complaint)
+    complaint = enforce_work_order_actor_access(current_user, wo)
 
-    wo.status = WorkOrderStatus.ACCEPTED.value
-    wo.updated_at = datetime.now(timezone.utc)
+    if complaint.status in INELIGIBLE_ACTIVE_WO_COMPLAINT_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot accept work order while complaint is in '{complaint.status}' status"
+        )
+
+    now_ts = datetime.now(timezone.utc)
+    claimed = (
+        db.query(WorkOrder)
+        .filter(WorkOrder.id == wo.id, WorkOrder.status == WorkOrderStatus.ASSIGNED.value)
+        .update(
+            {WorkOrder.status: WorkOrderStatus.ACCEPTED.value, WorkOrder.updated_at: now_ts},
+            synchronize_session=False,
+        )
+    )
+    if claimed != 1:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot accept work order while work order is in '{wo.status}' status"
+        )
 
     update_entry = WorkOrderUpdate(
         work_order_id=wo.id,
@@ -1474,15 +1636,47 @@ def submit_work_order_evidence(
     if not wo:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Work order not found")
 
-    if current_user.role == UserRole.FIELD_CREW.value and wo.crew_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied: Work order not assigned to you")
-    if current_user.role == UserRole.MUNICIPAL_MEMBER.value and wo.complaint:
-        enforce_complaint_department_scope(current_user, wo.complaint)
+    complaint = enforce_work_order_actor_access(current_user, wo)
 
-    wo.status = WorkOrderStatus.WORK_COMPLETED_PENDING_REVIEW.value
-    wo.completion_date = datetime.now(timezone.utc)
-    if wo.crew and wo.crew.crew_profile:
-        wo.crew.crew_profile.active_task_count = max(0, wo.crew.crew_profile.active_task_count - 1)
+    if complaint.status in INELIGIBLE_ACTIVE_WO_COMPLAINT_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot submit work-order evidence while complaint is in '{complaint.status}' status"
+        )
+
+    now_ts = datetime.now(timezone.utc)
+    claimable_wo_statuses = [
+        WorkOrderStatus.ASSIGNED.value,
+        WorkOrderStatus.ACCEPTED.value,
+        WorkOrderStatus.IN_PROGRESS.value,
+        WorkOrderStatus.BLOCKED.value,
+    ]
+    claimed = (
+        db.query(WorkOrder)
+        .filter(WorkOrder.id == wo.id, WorkOrder.status.in_(claimable_wo_statuses))
+        .update(
+            {
+                WorkOrder.status: WorkOrderStatus.WORK_COMPLETED_PENDING_REVIEW.value,
+                WorkOrder.completion_date: now_ts,
+                WorkOrder.updated_at: now_ts,
+            },
+            synchronize_session=False,
+        )
+    )
+    if claimed != 1:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot submit work-order evidence while work order is in '{wo.status}' status"
+        )
+
+    db.query(CrewProfile).filter(
+        CrewProfile.user_id == wo.crew_id,
+        CrewProfile.active_task_count > 0,
+    ).update(
+        {CrewProfile.active_task_count: CrewProfile.active_task_count - 1},
+        synchronize_session=False,
+    )
 
     # Record update
     update_entry = WorkOrderUpdate(
@@ -1503,19 +1697,17 @@ def submit_work_order_evidence(
     db.add(resolution)
 
     # Transition complaint to WORK_COMPLETED_PENDING_REVIEW
-    complaint = wo.complaint
-    if complaint:
-        old_status = complaint.status
-        complaint.status = ComplaintStatus.WORK_COMPLETED_PENDING_REVIEW.value
-        history = ComplaintStatusHistory(
-            complaint_id=complaint.id,
-            from_status=old_status,
-            to_status=ComplaintStatus.WORK_COMPLETED_PENDING_REVIEW.value,
-            changed_by_id=current_user.id,
-            change_reason="Field crew submitted repair completion evidence",
-            notes=data.completion_notes
-        )
-        db.add(history)
+    old_status = complaint.status
+    complaint.status = ComplaintStatus.WORK_COMPLETED_PENDING_REVIEW.value
+    history = ComplaintStatusHistory(
+        complaint_id=complaint.id,
+        from_status=old_status,
+        to_status=ComplaintStatus.WORK_COMPLETED_PENDING_REVIEW.value,
+        changed_by_id=current_user.id,
+        change_reason="Field crew submitted repair completion evidence",
+        notes=data.completion_notes
+    )
+    db.add(history)
 
     db.commit()
     db.refresh(wo)
@@ -1552,10 +1744,26 @@ def get_potential_duplicates(
     current_user: User = Depends(require_municipal_staff),
     db: Session = Depends(get_db)
 ):
-    """Lists AI-detected spatial & semantic duplicate complaints."""
+    """Lists AI-detected spatial & semantic duplicate complaints (department-scoped for municipal officers)."""
     duplicates = db.query(PotentialDuplicate).filter(PotentialDuplicate.status == "FLAGGED").all()
+    user_dept_id = None
+    if current_user.role == UserRole.MUNICIPAL_MEMBER.value:
+        membership = current_user.department_membership
+        if not membership or not membership.department_id:
+            return []
+        user_dept_id = membership.department_id
+
     results = []
     for d in duplicates:
+        if user_dept_id is not None:
+            p_dept = d.primary_complaint.department_id if d.primary_complaint else None
+            dup_dept = d.duplicate_complaint.department_id if d.duplicate_complaint else None
+            if not (
+                (p_dept == user_dept_id)
+                or (dup_dept == user_dept_id)
+                or (p_dept is None and dup_dept is None)
+            ):
+                continue
         results.append(PotentialDuplicateResponse(
             id=d.id,
             primary_complaint_id=d.primary_complaint_id,
@@ -1584,6 +1792,14 @@ def review_duplicate(
     if not record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Duplicate record not found")
 
+    target_scoped_complaint = (
+        record.duplicate_complaint
+        if (record.duplicate_complaint and record.duplicate_complaint.department_id is not None)
+        else (record.primary_complaint or record.duplicate_complaint)
+    )
+    if target_scoped_complaint:
+        enforce_complaint_department_scope(current_user, target_scoped_complaint)
+
     record.status = data.status.value
     record.reviewed_by_id = current_user.id
 
@@ -1593,12 +1809,13 @@ def review_duplicate(
             enforce_complaint_department_scope(current_user, dup_complaint)
             prev_dup_status = dup_complaint.status
             dup_complaint.status = ComplaintStatus.CANCELLED.value
+            primary_ref = record.primary_complaint.reference_number if record.primary_complaint else record.primary_complaint_id
             history = ComplaintStatusHistory(
                 complaint_id=dup_complaint.id,
                 from_status=prev_dup_status,
                 to_status=ComplaintStatus.CANCELLED.value,
                 changed_by_id=current_user.id,
-                change_reason=f"Merged as duplicate into #{record.primary_complaint.reference_number}",
+                change_reason=f"Merged as duplicate into #{primary_ref}",
                 notes=data.review_notes
             )
             db.add(history)

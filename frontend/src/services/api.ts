@@ -128,7 +128,7 @@ async function executeFetch(endpoint: string, options: RequestInit, tokenOverrid
     ...(options.headers as Record<string, string> || {}),
   };
 
-  if (!(options.body instanceof FormData) && !headers['Content-Type']) {
+  if (options.body !== undefined && !(options.body instanceof FormData) && !headers['Content-Type']) {
     headers['Content-Type'] = 'application/json';
   }
 
@@ -159,11 +159,11 @@ async function parseErrorResponse(response: Response): Promise<{ errorDetail: st
   return { errorDetail, data };
 }
 
-export async function apiRequest<T = any>(
+async function authorizedFetchResponse(
   endpoint: string,
   options: RequestInit = {},
   _hasRetried = false
-): Promise<T> {
+): Promise<Response> {
   const response = await executeFetch(endpoint, options);
 
   if (!response.ok) {
@@ -174,7 +174,7 @@ export async function apiRequest<T = any>(
       if (!_hasRetried) {
         const refreshedToken = await performTokenRefresh();
         if (refreshedToken) {
-          return apiRequest<T>(endpoint, options, true);
+          return authorizedFetchResponse(endpoint, options, true);
         }
       }
       clearAuthStorage();
@@ -185,9 +185,28 @@ export async function apiRequest<T = any>(
     throw new ApiError(response.status, errorDetail, data);
   }
 
+  return response;
+}
+
+export async function apiRequest<T = any>(
+  endpoint: string,
+  options: RequestInit = {},
+  _hasRetried = false
+): Promise<T> {
+  const response = await authorizedFetchResponse(endpoint, options, _hasRetried);
+
   const contentType = response.headers.get('content-type');
   if (contentType && contentType.includes('application/json')) {
     return response.json();
   }
   return response.text() as unknown as T;
+}
+
+export async function fetchAuthorizedBlob(
+  endpoint: string,
+  options: RequestInit = {},
+  _hasRetried = false
+): Promise<Blob> {
+  const response = await authorizedFetchResponse(endpoint, options, _hasRetried);
+  return response.blob();
 }

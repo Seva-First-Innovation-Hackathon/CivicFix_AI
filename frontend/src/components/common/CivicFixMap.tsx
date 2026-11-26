@@ -18,6 +18,7 @@ import {
   formatCoordinates, 
   MapProviderType 
 } from '../../config/mapConfig';
+import { AuthenticatedEvidenceImage } from './AuthenticatedEvidenceImage';
 
 // Fix Leaflet default marker icon paths in Vite bundling
 delete (L.Icon.Default.prototype as any)._getIconUrl;
@@ -38,7 +39,7 @@ export interface MapComplaintItem {
   latitude: number;
   longitude: number;
   address?: string;
-  first_image?: string;
+  first_attachment_id?: string;
 }
 
 // Data item interface for crew mode
@@ -574,9 +575,13 @@ export const CivicFixMap: React.FC<CivicFixMapProps> = ({
                             {c.category} • <strong className="text-slate-300">{c.status.replace(/_/g, ' ')}</strong>
                           </p>
 
-                          {c.first_image && (
+                          {c.first_attachment_id && (
                             <div className="mb-2 rounded-lg overflow-hidden border border-slate-700">
-                              <img src={c.first_image} alt="Defect" className="w-full h-24 object-cover" />
+                              <AuthenticatedEvidenceImage
+                                attachmentId={c.first_attachment_id}
+                                alt="Defect"
+                                className="w-full h-24 object-cover"
+                              />
                             </div>
                           )}
 

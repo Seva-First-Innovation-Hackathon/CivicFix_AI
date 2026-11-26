@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, require_citizen
 from app.models.entities import (
     Complaint, ComplaintAttachment, User, ComplaintStatusHistory,
     ResolutionVerification, ComplaintComment
@@ -455,7 +455,7 @@ def confirm_resolution(
     complaint_id: str,
     data: CitizenConfirmResolutionRequest,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_citizen),
     db: Session = Depends(get_db)
 ):
     """
@@ -541,7 +541,7 @@ def reopen_complaint(
     complaint_id: str,
     data: CitizenConfirmResolutionRequest,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_citizen),
     db: Session = Depends(get_db)
 ):
     """Citizen reports that problem remains unresolved. Reopens complaint with recorded justification."""
@@ -553,6 +553,16 @@ def reopen_complaint(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only the reporting citizen can contest resolution"
+        )
+
+    allowed_reopen_statuses = {
+        ComplaintStatus.AWAITING_CITIZEN_CONFIRMATION.value,
+        ComplaintStatus.RESOLVED.value,
+    }
+    if complaint.status not in allowed_reopen_statuses:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot reopen complaint while in '{complaint.status}' status"
         )
 
     if not data.reopen_reason or len(data.reopen_reason.strip()) < 5:

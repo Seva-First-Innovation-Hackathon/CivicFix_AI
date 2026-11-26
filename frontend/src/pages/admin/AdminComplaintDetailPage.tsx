@@ -8,11 +8,11 @@ import {
 } from 'lucide-react';
 import { adminService } from '../../services/adminService';
 import { complaintsService } from '../../services/complaintsService';
-import { resolveBackendUrl } from '../../services/api';
 import { Complaint, Department, User, ComplaintComment } from '../../types';
 import { StatusBadge, PriorityBadge } from '../../components/common/Badge';
 import { Button } from '../../components/common/Button';
 import { MapViewer } from '../../components/common/MapViewer';
+import { AuthenticatedEvidenceImage } from '../../components/common/AuthenticatedEvidenceImage';
 import { useToast } from '../../context/ToastContext';
 
 export const AdminComplaintDetailPage: React.FC = () => {
@@ -74,7 +74,7 @@ export const AdminComplaintDetailPage: React.FC = () => {
     Promise.all([
       adminService.getComplaint(id),
       adminService.getDepartments(),
-      adminService.listUsers('FIELD_CREW'),
+      adminService.listFieldCrews().catch(() => []),
       complaintsService.getComments(id).catch(() => [])
     ])
       .then(([comp, depts, crewUsers, comms]) => {
@@ -95,9 +95,6 @@ export const AdminComplaintDetailPage: React.FC = () => {
   useEffect(() => {
     loadData();
   }, [id]);
-
-  // Auth token for evidence rendering
-  const token = localStorage.getItem('civicfix_token') || '';
 
   // 1. Verify Complaint & Set Priority
   const handleVerifyComplaint = async () => {
@@ -534,7 +531,7 @@ export const AdminComplaintDetailPage: React.FC = () => {
                   latitude: complaint.latitude,
                   longitude: complaint.longitude,
                   address: complaint.address,
-                  first_image: complaint.attachments?.[0]?.file_path,
+                  first_attachment_id: complaint.attachments?.[0]?.id,
                 }]}
                 center={[complaint.latitude, complaint.longitude]}
                 zoom={15}
@@ -818,19 +815,12 @@ export const AdminComplaintDetailPage: React.FC = () => {
             <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">Attached Evidence</h3>
             {complaint.attachments && complaint.attachments.length > 0 ? (
               <div className="space-y-3">
-                {complaint.attachments.map((att) => {
-                  const secureUrl = att.id && token 
-                    ? resolveBackendUrl(`/api/v1/evidence/${att.id}?token=${token}`)
-                    : resolveBackendUrl(att.file_path);
-                  return (
+                {complaint.attachments.map((att) => (
                     <div key={att.id} className="border border-slate-200 rounded-2xl overflow-hidden bg-slate-50">
-                      <img 
-                        src={secureUrl} 
-                        alt="Evidence" 
-                        onError={(e) => {
-                          e.currentTarget.src = resolveBackendUrl(att.file_path);
-                        }}
-                        className="w-full h-44 object-cover" 
+                      <AuthenticatedEvidenceImage
+                        attachmentId={att.id}
+                        alt="Evidence"
+                        className="w-full h-44 object-cover"
                       />
                       <div className="p-2 text-[10px] text-slate-500 flex justify-between items-center">
                         <span className={`font-semibold px-2 py-0.5 rounded-full ${
@@ -851,8 +841,7 @@ export const AdminComplaintDetailPage: React.FC = () => {
                         </div>
                       )}
                     </div>
-                  );
-                })}
+                ))}
               </div>
             ) : (
               <p className="text-xs text-slate-400 text-center py-6">No photographs attached.</p>

@@ -5,11 +5,11 @@ import {
   Sparkles, ShieldCheck, XCircle, Star, MessageSquare 
 } from 'lucide-react';
 import { complaintsService } from '../../services/complaintsService';
-import { resolveBackendUrl } from '../../services/api';
 import { Complaint, StatusHistory } from '../../types';
 import { StatusBadge, PriorityBadge } from '../../components/common/Badge';
 import { Button } from '../../components/common/Button';
 import { MapViewer } from '../../components/common/MapViewer';
+import { AuthenticatedEvidenceImage } from '../../components/common/AuthenticatedEvidenceImage';
 import { useToast } from '../../context/ToastContext';
 
 export const ComplaintDetailsPage: React.FC = () => {
@@ -357,7 +357,7 @@ export const ComplaintDetailsPage: React.FC = () => {
                   latitude: complaint.latitude,
                   longitude: complaint.longitude,
                   address: complaint.address,
-                  first_image: complaint.attachments?.[0]?.file_path,
+                  first_attachment_id: complaint.attachments?.find((a) => !a.is_internal)?.id,
                 }]}
                 center={[complaint.latitude, complaint.longitude]}
                 zoom={15}
@@ -372,8 +372,8 @@ export const ComplaintDetailsPage: React.FC = () => {
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 {complaint.attachments.map((att) => (
                   <div key={att.id} className="border border-slate-200 rounded-2xl overflow-hidden bg-slate-50">
-                    <img
-                      src={resolveBackendUrl(att.file_path)}
+                    <AuthenticatedEvidenceImage
+                      attachmentId={att.id}
                       alt="Complaint attachment"
                       className="w-full h-48 object-cover hover:scale-105 transition duration-300"
                     />

@@ -135,7 +135,7 @@ describe('Phase 2 Frontend UI — Hotspots, AI Mismatches, Overdue SLA, & Eviden
       ],
     });
     vi.spyOn(adminService, 'getDepartments').mockResolvedValue([]);
-    vi.spyOn(adminService, 'listUsers').mockResolvedValue([]);
+    vi.spyOn(adminService, 'listFieldCrews').mockResolvedValue([]);
     vi.spyOn(complaintsService, 'getComments').mockResolvedValue([]);
 
     render(

@@ -36,7 +36,7 @@ export const CitizenDashboard: React.FC = () => {
     latitude: c.latitude,
     longitude: c.longitude,
     address: c.address,
-    first_image: c.attachments?.[0]?.file_path,
+    first_attachment_id: c.attachments?.find((a) => !a.is_internal)?.id,
   }));
 
   return (

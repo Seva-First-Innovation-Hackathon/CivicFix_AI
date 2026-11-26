@@ -28,6 +28,7 @@ export const ReportIssuePage: React.FC = () => {
   const [privacyConsent, setPrivacyConsent] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submittedComplaint, setSubmittedComplaint] = useState<Complaint | null>(null);
+  const [attachmentUploadError, setAttachmentUploadError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const { success, error: toastError } = useToast();
@@ -67,6 +68,7 @@ export const ReportIssuePage: React.FC = () => {
 
     setSubmitting(true);
     setError(null);
+    setAttachmentUploadError(null);
 
     try {
       // 1. Create complaint record in PostgreSQL
@@ -82,15 +84,23 @@ export const ReportIssuePage: React.FC = () => {
       });
 
       // 2. Upload photo attachment if selected
+      let uploadWarning: string | null = null;
       if (selectedFile) {
         try {
           await complaintsService.uploadAttachment(complaint.id, selectedFile, 'ORIGINAL');
-        } catch {
-          // Photo upload warning without failing ticket
+        } catch (uploadErr: any) {
+          uploadWarning = uploadErr?.message
+            ? `Photo upload failed (${uploadErr.message}). Your complaint #${complaint.reference_number} was saved without the photo.`
+            : `Photo upload failed. Your complaint #${complaint.reference_number} was saved without the photo.`;
+          setAttachmentUploadError(uploadWarning);
         }
       }
 
-      success('Complaint Submitted Successfully', `Reference: #${complaint.reference_number}`);
+      if (uploadWarning) {
+        toastError('Complaint Saved — Photo Upload Failed', uploadWarning);
+      } else {
+        success('Complaint Submitted Successfully', `Reference: #${complaint.reference_number}`);
+      }
       setSubmittedComplaint(complaint);
     } catch (err: any) {
       setError(err.message || 'Failed to submit complaint. Please check your connection.');
@@ -117,6 +127,16 @@ export const ReportIssuePage: React.FC = () => {
               Your civic report has been securely saved in the municipal registry. Automated AI triage has analyzed the report and scheduled initial operational review.
             </p>
           </div>
+
+          {attachmentUploadError && (
+            <div className="flex items-start gap-2.5 p-3.5 bg-amber-50 border border-amber-200 text-amber-900 rounded-2xl text-left text-xs">
+              <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5 text-amber-600" />
+              <div>
+                <p className="font-bold">Photographic evidence could not be uploaded</p>
+                <p className="text-amber-800 mt-0.5">{attachmentUploadError}</p>
+              </div>
+            </div>
+          )}
 
           <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200 text-left text-xs space-y-2">
             <div className="flex justify-between">

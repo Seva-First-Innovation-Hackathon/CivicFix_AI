@@ -6,10 +6,14 @@ services:
     plan: free
     rootDir: backend
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "sh -c 'python migrate.py && ([ -n \"$INITIAL_ADMIN_PASSWORD\" ] && python bootstrap.py || true) && uvicorn app.main:app --host 0.0.0.0 --port $PORT'"
+    startCommand: "sh -c 'python migrate.py && python bootstrap.py && uvicorn app.main:app --host 0.0.0.0 --port $PORT'"
     healthCheckPath: /health
     autoDeploy: true
     envVars:
+      - key: INITIAL_ADMIN_EMAIL
+        sync: false # Explicit operator-supplied initial administrator email (required on fresh DB before startup)
+      - key: INITIAL_ADMIN_PASSWORD
+        sync: false # Secret: enter strong initial admin password (>= 8 chars) in Render Dashboard before first deploy
       - key: PYTHON_VERSION
         value: 3.12.0
       - key: ENVIRONMENT

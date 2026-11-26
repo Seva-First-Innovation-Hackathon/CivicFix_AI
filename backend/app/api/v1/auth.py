@@ -244,10 +244,36 @@ def refresh_token(request: Request, data: RefreshTokenRequest, db: Session = Dep
         family_id=rt.family_id,
     )
 
-    rt.is_revoked = True
-    rt.revoked_at = now
-    rt.revoked_reason = "rotated"
-    rt.replaced_by_jti = new_jti
+    updated = (
+        db.query(RefreshToken)
+        .filter(RefreshToken.id == rt.id, RefreshToken.is_revoked == False)
+        .update(
+            {
+                RefreshToken.is_revoked: True,
+                RefreshToken.revoked_at: now,
+                RefreshToken.revoked_reason: "rotated",
+                RefreshToken.replaced_by_jti: new_jti,
+            },
+            synchronize_session=False,
+        )
+    )
+    if updated != 1:
+        _revoke_token_family(db, rt.family_id, reason="refresh_token_concurrent_reuse")
+        log_audit(
+            db=db,
+            action="REFRESH_TOKEN_REUSE_DETECTED",
+            entity_type="USER",
+            entity_id=rt.user_id,
+            user_id=rt.user_id,
+            details={"reused_jti": rt.jti, "family_id": rt.family_id, "reason": "concurrent_cas_race"},
+            ip_address=request.client.host if request.client else None,
+            commit=False,
+        )
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token has been revoked or reused. Please sign in again.",
+        )
 
     db.add(RefreshToken(
         jti=new_jti,

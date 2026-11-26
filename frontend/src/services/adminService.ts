@@ -173,7 +173,7 @@ export const adminService = {
       address?: string;
       created_at: string;
       has_attachments: boolean;
-      first_image?: string;
+      first_attachment_id?: string;
     }>;
   }> {
     const searchParams = new URLSearchParams();
@@ -261,6 +261,10 @@ export const adminService = {
   async listUsers(role?: string): Promise<User[]> {
     const query = role ? `?role=${role}` : '';
     return apiRequest<User[]>(`/admin/users${query}`);
+  },
+
+  async listFieldCrews(): Promise<User[]> {
+    return apiRequest<User[]>('/admin/crews');
   },
 
   async createStaffUser(data: {

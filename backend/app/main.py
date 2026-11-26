@@ -108,7 +108,6 @@ async def attach_request_correlation_id(request: Request, call_next):
 def get_authorized_upload_file(
     folder: str,
     filename: str,
-    token: Optional[str] = Query(None),
     authorization: Optional[str] = Header(None),
     signed: bool = Query(False),
     db: Session = Depends(get_db)
@@ -120,7 +119,7 @@ def get_authorized_upload_file(
     if folder not in storage_service.ALLOWED_FOLDERS or "/" in filename or "\\" in filename or ".." in filename:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid upload path")
 
-    user = resolve_evidence_user(token=token, authorization=authorization, db=db)
+    user = resolve_evidence_user(authorization=authorization, db=db)
     rel_path = f"/uploads/{folder}/{filename}"
     attachment = db.query(ComplaintAttachment).filter(ComplaintAttachment.file_path == rel_path).first()
     att, _meta = authorize_and_resolve_attachment(db=db, user=user, attachment=attachment)

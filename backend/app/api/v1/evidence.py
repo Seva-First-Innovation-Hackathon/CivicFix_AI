@@ -21,18 +21,16 @@ router = APIRouter(prefix="/evidence", tags=["Evidence & Attachments"])
 
 
 def resolve_evidence_user(
-    token: Optional[str] = Query(None),
     authorization: Optional[str] = Header(None),
     db: Session = Depends(get_db),
 ) -> User:
     """
-    Extracts and authenticates user from Authorization header or short-lived token query param.
+    Extracts and authenticates user strictly from the Authorization: Bearer header.
+    Query-string tokens are disallowed to avoid credential leakage in URLs/logs.
     """
     raw_token = None
     if authorization and authorization.startswith("Bearer "):
         raw_token = authorization.split(" ", 1)[1].strip()
-    elif token:
-        raw_token = token.strip()
 
     if not raw_token:
         raise HTTPException(

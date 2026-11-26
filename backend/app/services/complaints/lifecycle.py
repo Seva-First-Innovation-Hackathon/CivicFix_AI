@@ -3,13 +3,60 @@ from typing import Optional, Dict, List
 from fastapi import HTTPException, status, BackgroundTasks
 from sqlalchemy.orm import Session
 
-from app.models.entities import Complaint, ComplaintStatusHistory, User, WorkOrder
-from app.models.enums import UserRole, ComplaintStatus, NotificationType
+from app.models.entities import Complaint, ComplaintStatusHistory, MunicipalDepartment, User, WorkOrder
+from app.models.enums import UserRole, ComplaintStatus, NotificationType, WorkOrderStatus
 from app.services.audit import log_audit
 from app.services.notifications.service import send_notification
 from app.services.email.service import email_service
 
 logger = logging.getLogger(__name__)
+
+ELIGIBLE_ASSIGNMENT_STATUSES = {
+    ComplaintStatus.SUBMITTED.value,
+    ComplaintStatus.AI_ANALYSIS_PENDING.value,
+    ComplaintStatus.UNDER_REVIEW.value,
+    ComplaintStatus.VERIFIED.value,
+    ComplaintStatus.ASSIGNED.value,
+    ComplaintStatus.REOPENED.value,
+    ComplaintStatus.FLAGGED_FOR_INVESTIGATION.value,
+}
+
+ELIGIBLE_WORK_ORDER_COMPLAINT_STATUSES = {
+    ComplaintStatus.SUBMITTED.value,
+    ComplaintStatus.AI_ANALYSIS_PENDING.value,
+    ComplaintStatus.UNDER_REVIEW.value,
+    ComplaintStatus.VERIFIED.value,
+    ComplaintStatus.ASSIGNED.value,
+    ComplaintStatus.IN_PROGRESS.value,
+}
+
+INELIGIBLE_ACTIVE_WO_COMPLAINT_STATUSES = {
+    ComplaintStatus.WORK_COMPLETED_PENDING_REVIEW.value,
+    ComplaintStatus.AWAITING_CITIZEN_CONFIRMATION.value,
+    ComplaintStatus.RESOLVED.value,
+    ComplaintStatus.CANCELLED.value,
+    ComplaintStatus.REJECTED.value,
+}
+
+ALLOWED_WORK_ORDER_PATCH_TRANSITIONS: Dict[str, set[str]] = {
+    WorkOrderStatus.ASSIGNED.value: {
+        WorkOrderStatus.ACCEPTED.value,
+        WorkOrderStatus.IN_PROGRESS.value,
+        WorkOrderStatus.BLOCKED.value,
+    },
+    WorkOrderStatus.ACCEPTED.value: {
+        WorkOrderStatus.IN_PROGRESS.value,
+        WorkOrderStatus.BLOCKED.value,
+    },
+    WorkOrderStatus.IN_PROGRESS.value: {
+        WorkOrderStatus.IN_PROGRESS.value,
+        WorkOrderStatus.BLOCKED.value,
+    },
+    WorkOrderStatus.BLOCKED.value: {
+        WorkOrderStatus.IN_PROGRESS.value,
+        WorkOrderStatus.BLOCKED.value,
+    },
+}
 
 # Permitted server-side complaint lifecycle state machine
 VALID_TRANSITIONS: Dict[str, List[str]] = {
@@ -135,6 +182,128 @@ def enforce_complaint_staff_access(db: Session, user: User, complaint: Complaint
     if user.role == UserRole.MUNICIPAL_MEMBER.value:
         enforce_complaint_department_scope(user, complaint)
         return
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+
+def _jurisdictions_conflict(j_a: Optional[str], j_b: Optional[str]) -> bool:
+    """Returns True when both jurisdictions are explicitly scoped (not 'City-wide') and differ."""
+    norm_a = (j_a or "").strip()
+    norm_b = (j_b or "").strip()
+    if not norm_a or not norm_b:
+        return False
+    if norm_a.lower() == "city-wide" or norm_b.lower() == "city-wide":
+        return False
+    return norm_a.lower() != norm_b.lower()
+
+
+def enforce_department_dispatch_scope(
+    user: User,
+    complaint: Complaint,
+    target_dept: MunicipalDepartment,
+    crew: Optional[User] = None,
+    require_complaint_dept_match: bool = False,
+) -> None:
+    """
+    Validates full department, municipality/jurisdiction, complaint, and field-crew authorization
+    chains before assignment or work-order dispatch.
+    """
+    if not target_dept.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Target municipal department is inactive",
+        )
+
+    if complaint.department and _jurisdictions_conflict(complaint.department.jurisdiction, target_dept.jurisdiction):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: Target department belongs to a different municipal jurisdiction than the complaint",
+        )
+
+    if user.role == UserRole.MUNICIPAL_MEMBER.value:
+        membership = user.department_membership
+        if not membership or not membership.department_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: Officer has no active municipal department assignment",
+            )
+        if _jurisdictions_conflict(membership.jurisdiction, target_dept.jurisdiction):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: Municipal officer jurisdiction does not match target department",
+            )
+        if target_dept.id != membership.department_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: Municipal officers cannot assign or dispatch work into another department",
+            )
+        enforce_complaint_department_scope(user, complaint)
+    elif user.role != UserRole.GOVERNMENT_ADMIN.value:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    if require_complaint_dept_match and complaint.department_id and complaint.department_id != target_dept.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Complaint belongs to a different municipal department than the selected work-order department",
+        )
+
+    if crew is not None:
+        if crew.role != UserRole.FIELD_CREW.value or not crew.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Selected assignee is not an active field crew member",
+            )
+        if not crew.crew_profile or not crew.crew_profile.department_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Selected field crew lacks a valid municipal department profile",
+            )
+        if crew.crew_profile.department_id != target_dept.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN
+                if user.role == UserRole.MUNICIPAL_MEMBER.value
+                else status.HTTP_400_BAD_REQUEST,
+                detail="Access denied: Selected field crew belongs to a different municipal department",
+            )
+
+
+def enforce_work_order_actor_access(user: User, wo: WorkOrder) -> Complaint:
+    """
+    Verifies complaint existence, work-order linkage, active department/crew profile,
+    and role jurisdiction for work-order actions (accept, status PATCH, submit-evidence).
+    """
+    complaint = wo.complaint
+    if not complaint:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Work order is not linked to a valid complaint",
+        )
+
+    if user.role == UserRole.GOVERNMENT_ADMIN.value:
+        return complaint
+
+    if user.role == UserRole.FIELD_CREW.value:
+        if wo.crew_id != user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: Work order is not assigned to you — you can only update your assigned work orders",
+            )
+        if not user.crew_profile or user.crew_profile.department_id != wo.department_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: Field crew department profile does not match work order department",
+            )
+        return complaint
+
+    if user.role == UserRole.MUNICIPAL_MEMBER.value:
+        membership = user.department_membership
+        if not membership or not membership.department_id or membership.department_id != wo.department_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: Work order belongs to another municipal department",
+            )
+        enforce_complaint_department_scope(user, complaint)
+        return complaint
+
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
 
